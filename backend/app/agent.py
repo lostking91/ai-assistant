@@ -32,12 +32,13 @@ from agentscope.state import AgentState
 
 from . import database as db
 from . import memory_client
+from . import memory_retriever
 from .config import settings
 from .tools import build_toolkit
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是一个友好、专业的中文 AI 助手，名字叫"AI助手"。
+BASE_SYSTEM_PROMPT = """你是一个友好、专业的中文 AI 助手，名字叫"AI助手"。
 
 # 行为准则
 1. 使用简体中文回答，语气自然、简洁、专业。
@@ -63,7 +64,26 @@ SYSTEM_PROMPT = """你是一个友好、专业的中文 AI 助手，名字叫"AI
    - 返回"仍在后台处理中"或失败时，如实告知，绝不可承诺已保存。
 3. 用户没有明确要求记住时，不要主动调用 save_memory。
 4. 当前会话内的上下文你本来就能记住，无需为此调用工具。
+5. 系统会在需要时自动把检索到的历史记忆附在本提示词末尾（"# 检索到的长期记忆"小节）。
+   这些是长期记忆，跨会话有效，不需要调用任何工具去获取；
+   是否采用由你按该小节的使用规则自行判断。
 """
+
+
+def build_system_prompt(memory_block: str = "") -> str:
+    """按轮组装 system_prompt：基础人设 + 本轮检索到的记忆块。
+
+    为什么可以安全地每轮动态注入（已查 AgentScope 2.0.9 源码验证）：
+      - Agent._get_system_prompt() 在每次模型调用时动态拼装，system_prompt
+        **不写入 state.context**，因此不会污染持久化会话历史；
+      - 既然不进 context，写侧钩子（memory_client.enqueue_turn 只采集
+        user/assistant 两条消息）也就不会把注入的记忆再投递回 GM，
+        避免"记忆自我循环增殖"。
+    """
+    if not memory_block:
+        return BASE_SYSTEM_PROMPT
+    return f"{BASE_SYSTEM_PROMPT}\n\n{memory_block}"
+
 
 
 @dataclass
@@ -101,17 +121,20 @@ def _build_model() -> DashScopeChatModel:
 
 
 async def _build_agent(
-    state: AgentState | None = None, session_id: str | None = None
+    state: AgentState | None = None,
+    session_id: str | None = None,
+    memory_block: str = "",
 ) -> Agent:
     """构建智能体实例。
 
     AgentScope 2.x 中 toolkit 需要 async 注册，故此处为协程。
     session_id 用于注册 save_memory 工具（GM 会话绑定契约）。
+    memory_block 为本轮检索到的长期记忆（已渲染），拼进 system_prompt。
     """
     toolkit = await build_toolkit(session_id=session_id)
     return Agent(
         name=settings.agent_name,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=build_system_prompt(memory_block),
         model=_build_model(),
         toolkit=toolkit,
         state=state,
@@ -119,6 +142,7 @@ async def _build_agent(
         # 时区设为东八区，运行时状态注入的时间才对得上
         injection_config=InjectionConfig(timezone="Asia/Shanghai"),
     )
+
 
 
 # ------------------------------------------------------------------ 会话管理
@@ -215,10 +239,37 @@ async def extract_history(session_id: str) -> tuple[str, list[dict[str, Any]]]:
 # ------------------------------------------------------------------ 对话（非流式）
 
 
+async def _recall_memory_block(message: str) -> tuple[str, dict[str, Any]]:
+    """检索长期记忆并渲染成 system_prompt 片段。
+
+    返回 (memory_block, debug_info)。检索失败/超时/未启用时 memory_block 为空串，
+    对话照常进行（降级为"本轮无记忆"），绝不影响主链路。
+    """
+    result = await memory_retriever.recall(message)
+    block = memory_retriever.format_memories_for_prompt(result)
+    debug = {
+        "memory_hits": len(result.memories),
+        "memory_elapsed_ms": result.elapsed_ms,
+        "memory_degraded": result.degraded,
+        "memory_reason": result.reason,
+        "memory_items": [
+            {
+                "content": m.content,
+                "cognitive_type": m.cognitive_type,
+                "similarity": round(m.similarity, 3),
+            }
+            for m in result.memories
+        ],
+    }
+    return block, debug
+
+
 async def chat(message: str, session_id: str | None, resume: bool = False) -> dict[str, Any]:
-    """完整一轮对话：恢复会话 -> 智能体回复 -> 持久化。"""
+    """完整一轮对话：检索记忆 -> 恢复会话 -> 智能体回复 -> 持久化。"""
     sid, state, is_new = await resolve_session(session_id, resume)
-    agent = await _build_agent(state, session_id=sid)
+    memory_block, mem_debug = await _recall_memory_block(message)
+    agent = await _build_agent(state, session_id=sid, memory_block=memory_block)
+
 
     try:
         reply_msg = await agent.reply(UserMsg(name="user", content=message))
@@ -256,6 +307,7 @@ async def chat(message: str, session_id: str | None, resume: bool = False) -> di
         "title": title,
         "is_new_session": is_new,
         "tool_calls": tool_calls,
+        "memory": mem_debug,
     }
 
 
@@ -269,25 +321,18 @@ async def chat_stream(
 
     事件类型：
       meta          {session_id, is_new_session, title}
+      memory_start  {}          —— 开始检索长期记忆（前端可显示"正在回忆…"）
+      memory        {hits, elapsed_ms, degraded, reason, items}
       tool_start    {name}
       tool_result   {name, state}
       delta         {text}      —— 文本增量
-      done          {reply, tool_calls, session_id, title}
+      done          {reply, tool_calls, session_id, title, memory}
       error         {message}
     """
     try:
         sid, state, is_new = await resolve_session(session_id, resume)
     except Exception as exc:  # noqa: BLE001
         yield {"type": "error", "message": f"会话恢复失败：{exc}"}
-        return
-
-    try:
-        agent = await _build_agent(state, session_id=sid)
-    except AssistantError as exc:
-        yield {"type": "error", "message": str(exc)}
-        return
-    except Exception as exc:  # noqa: BLE001
-        yield {"type": "error", "message": f"智能体初始化失败：{exc}"}
         return
 
     row = await db.get_session(sid)
@@ -298,6 +343,21 @@ async def chat_stream(
         "is_new_session": is_new,
         "title": title,
     }
+
+    # 记忆检索：先给前端一个"正在回忆"信号，再执行（实测 0.2-0.35s）
+    if memory_retriever.retrieval_enabled():
+        yield {"type": "memory_start"}
+    memory_block, mem_debug = await _recall_memory_block(message)
+    yield {"type": "memory", **mem_debug}
+
+    try:
+        agent = await _build_agent(state, session_id=sid, memory_block=memory_block)
+    except AssistantError as exc:
+        yield {"type": "error", "message": str(exc)}
+        return
+    except Exception as exc:  # noqa: BLE001
+        yield {"type": "error", "message": f"智能体初始化失败：{exc}"}
+        return
 
     result = StreamResult()
     # block_id -> 已累积文本，用于兼容 delta 为"增量"或"全量"两种实现
@@ -389,6 +449,7 @@ async def chat_stream(
         "tool_calls": result.tool_calls,
         "finished_reason": result.finished_reason,
         "error": result.error,
+        "memory": mem_debug,
     }
 
 

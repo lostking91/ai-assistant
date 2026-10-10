@@ -41,6 +41,29 @@ class Settings(BaseSettings):
     gm_user_id: str = "gm_user_lw"
     gm_wait_timeout_ms: int = 15000
 
+    # ---- GeneralMemory 记忆服务（读取侧 / 本地向量检索） ----
+    # 说明：GM 的 POST /api/v1/memories:search 硬编码了 LLM 适用性判定（实测 6.5-9s），
+    # 无法关闭；GM 源码冻结不改。故读取侧直连 GM 的 PostgreSQL 自行做向量检索，
+    # 相关性判断交给对话模型本身（注入 system_prompt）。详见 app/memory_retriever.py。
+    memory_read_enabled: bool = True
+    # GM 的 Postgres 连接串（可沿用 GM .env 的 MEMORY_DATABASE_URL，
+    # postgresql+psycopg:// 方言会被自动规范化；localhost 会自动改 127.0.0.1 避免 IPv6 拖慢）
+    gm_db_url: str = ""
+    gm_tenant_id: str = "cmic-yun"
+    # embedding 必须与 GM 写入侧同模型，否则向量不可比
+    gm_embedding_api_key: str = ""
+    gm_embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    gm_embedding_model: str = "BAAI/bge-m3"
+    memory_read_limit: int = 5
+    memory_read_scene_top_k: int = 3
+    memory_read_timeout_ms: int = 2500
+    # 余弦距离上限，超过视为不相关直接丢弃（实测相关命中 0.21，无关噪声 0.47+）
+    memory_read_max_distance: float = 0.62
+    # 是否复刻 GM 的证据链校验（关闭可再省 ~50ms，但可能召回已失效证据的记忆）
+    memory_read_validate_evidence: bool = True
+    # 短于该字符数不检索（"你好""继续"这类无检索价值）
+    memory_read_min_query_chars: int = 2
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

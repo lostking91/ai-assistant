@@ -35,6 +35,9 @@ class ChatResponse(BaseModel):
     title: str
     is_new_session: bool = False
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    memory: dict[str, Any] | None = Field(
+        default=None, description="本轮长期记忆检索明细（命中数、耗时、是否降级等）"
+    )
 
 
 class SessionItem(BaseModel):

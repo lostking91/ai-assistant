@@ -243,7 +243,38 @@ npm install @esbuild/win32-x64@0.25.12 --no-save
 
 > 以下命令在 **Git Bash** 下执行（当前环境默认 shell）。Windows PowerShell/CMD 用户请把路径分隔符 `\` 替换、并使用 `venv\Scripts\python.exe`。
 
-### 启动后端（:8000）
+### 运行拓扑与端口
+
+| 进程 | 端口 | 说明 | 日志文件 |
+|---|---|---|---|
+| 后端 uvicorn（`app.main:app`） | 127.0.0.1:8000 | 对话/会话/记忆写入 API | `backend/backend.log` |
+| 前端 Vite dev | 127.0.0.1:5173 | 聊天界面，`/api` 代理到 :8000 | `frontend_vite.log`（项目根） |
+| （依赖）GM API | 127.0.0.1:8001 | 启用记忆时需要，见[第十二章](#121-gm-环境启动三件套) | — |
+| （依赖）GM Postgres | 127.0.0.1:5433 | docker 容器 `memory-cmic-postgres` | — |
+
+### 实际后台启动（当前采用，可复现）
+
+> 后台方式不加 `--reload`；改代码或改 `.env` 后需手动重启后端才生效。前端用受管 node 直接跑 `vite.js`，避免依赖 PATH 里的 `npm`。
+
+```bash
+# ① 后端（:8000），日志追加到 backend.log
+cd /f/proj_test/ai2026/memory-research/ai-assistant/backend
+./venv/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 >> backend.log 2>&1 &
+
+# ② 前端（:5173），受管 node 跑 vite.js，日志追加到项目根 frontend_vite.log
+cd /f/proj_test/ai2026/memory-research/ai-assistant/frontend
+"C:/Users/Administrator/.workbuddy/binaries/node/versions/22.22.2-6/node.exe" node_modules/vite/bin/vite.js >> ../frontend_vite.log 2>&1 &
+```
+
+启动后验证：
+
+```bash
+sleep 5
+curl -s http://127.0.0.1:8000/api/health                                       # {"status":"ok",...}
+curl -s -o /dev/null -w "frontend HTTP %{http_code}\n" http://127.0.0.1:5173/   # 200
+```
+
+### 启动后端（:8000）— 前台/开发模式
 
 ```bash
 cd backend
@@ -487,7 +518,7 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 
 ### 12.1 GM 环境启动（三件套）
 
-GM 源码位于同级目录 `../GeneralMemory-2.1.0/`，依赖 PostgreSQL（Docker）+ API + Worker 三个进程：
+GM 源码位于同级目录 `../GeneralMemory/`（当前 v2.4.0，只读同步上游）。**完整启动/健康检查/升级流程见 [`../GeneralMemory/README.md`](../GeneralMemory/README.md)**，此处仅列启用记忆所需的最小三件套（Postgres + API + add Worker）：
 
 **① PostgreSQL 容器**（数据持久化，端口 5433 避开本机默认 5432）：
 
@@ -499,24 +530,24 @@ docker start memory-cmic-postgres
 #   -e POSTGRES_PASSWORD=memory_cmic_local_dev postgres:16
 ```
 
-**② GM API**（:8001，Git Bash）：
+**② GM API**（:8001，Git Bash；GM 无 python-dotenv，必须先 source .env 注入环境变量）：
 
 ```bash
-cd ../GeneralMemory-2.1.0
+cd ../GeneralMemory
 set -a && . ./.env && set +a
 ./.venv/Scripts/python.exe -m uvicorn memory_cmic.api:create_app \
   --factory --host 127.0.0.1 --port 8001
 ```
 
-**③ GM Worker**（add 角色，负责实际抽取/治理）：
+**③ GM Worker**（add 角色，负责实际抽取/治理；如需画像/巩固另启 `maintenance`/`consolidation`/`profile` 角色）：
 
 ```bash
-cd ../GeneralMemory-2.1.0
+cd ../GeneralMemory
 set -a && . ./.env && set +a
-./.venv/Scripts/python.exe -m memory_cmic.worker --role add
+./.venv/Scripts/memory-cmic-worker.exe --role add
 ```
 
-验证：`curl http://127.0.0.1:8001/healthz`（或 GM 文档约定的健康端点）返回正常。
+验证：`curl -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/docs` 返回 200。
 
 ### 12.2 后端配置
 
@@ -678,4 +709,4 @@ pip install -r requirements.txt -i https://pypi.org/simple
 
 ---
 
-*最后更新：2026-10-09（任务2 · GeneralMemory 写入侧接入完成）*
+*最后更新：2026-10-10（第六章补充实际后台启动命令与端口拓扑；12.1 GM 路径更新为 `../GeneralMemory/`，对齐 v2.4.0）*
