@@ -1,0 +1,12 @@
+# AI 助手后端依赖
+# 安装命令（清华源无 agentscope，需指定官方源）：
+#   pip install -r requirements.txt -i https://pypi.org/simple
+
+agentscope==2.0.9
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+dashscope>=1.20.0
+httpx>=0.27.0
