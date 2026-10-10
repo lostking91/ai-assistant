@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 助手 - Claude Design 风格</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #FFFFFF;
+            color: #2C2C2C;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 标题栏 */
+        .header {
+            background-color: #FFFFFF;
+            border-bottom: 1px solid #E5E5E5;
+            padding: 14px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo {
+            width: 28px;
+            height: 28px;
+            background-color: #D97757;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+        }
+
+        .header-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #1A1A1A;
+        }
+
+        .new-chat-btn {
+            background-color: #D97757;
+            border: none;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .new-chat-btn:hover {
+            background-color: #CC6B4A;
+        }
+
+        /* 消息区域 */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 32px 24px;
+            max-width: 760px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        .message {
+            margin-bottom: 28px;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message-time {
+            font-size: 11px;
+            color: #8C8C8C;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+
+        .message-user {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 20px;
+        }
+
+        .message-user .bubble {
+            background-color: #F5F0E8;
+            color: #2C2C2C;
+            padding: 12px 16px;
+            border-radius: 16px 16px 4px 16px;
+            max-width: 70%;
+            line-height: 1.6;
+            font-size: 14px;
+            border: 1px solid #E8E3DB;
+        }
+
+        .message-ai {
+            display: flex;
+            justify-content: flex-start;
+            margin-bottom: 20px;
+        }
+
+        .message-ai .bubble {
+            background-color: #FFFFFF;
+            color: #2C2C2C;
+            padding: 14px 18px;
+            border-radius: 16px 16px 16px 4px;
+            max-width: 85%;
+            line-height: 1.7;
+            font-size: 14px;
+            border: 1px solid #E5E5E5;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+        }
+
+        .message-ai .avatar {
+            width: 30px;
+            height: 30px;
+            background-color: #D97757;
+            border-radius: 50%;
+            margin-right: 10px;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .message-ai .content-wrapper {
+            display: flex;
+            align-items: flex-start;
+        }
+
+        /* 输入框区域 */
+        .input-area {
+            background-color: #FFFFFF;
+            border-top: 1px solid #E5E5E5;
+            padding: 18px 24px;
+        }
+
+        .input-wrapper {
+            max-width: 760px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .input-box {
+            width: 100%;
+            background-color: #FAFAFA;
+            border: 1px solid #E5E5E5;
+            border-radius: 10px;
+            padding: 12px 50px 12px 16px;
+            color: #2C2C2C;
+            font-size: 14px;
+            resize: none;
+            outline: none;
+            min-height: 48px;
+            font-family: inherit;
+            transition: all 0.2s;
+        }
+
+        .input-box:focus {
+            border-color: #D97757;
+            background-color: #FFFFFF;
+        }
+
+        .input-box::placeholder {
+            color: #999;
+        }
+
+        .send-btn {
+            position: absolute;
+            right: 10px;
+            bottom: 10px;
+            background-color: #D97757;
+            border: none;
+            color: white;
+            width: 34px;
+            height: 34px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        .send-btn:hover {
+            background-color: #CC6B4A;
+            transform: scale(1.05);
+        }
+
+        .input-hint {
+            text-align: center;
+            font-size: 12px;
+            color: #999;
+            margin-top: 10px;
+        }
+
+        /* 滚动条样式 */
+        .chat-container::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .chat-container::-webkit-scrollbar-thumb {
+            background: #DDD;
+            border-radius: 3px;
+        }
+
+        .chat-container::-webkit-scrollbar-thumb:hover {
+            background: #BBB;
+        }
+    </style>
+</head>
+<body>
+    <!-- 标题栏 -->
+    <div class="header">
+        <div class="header-left">
+            <div class="logo">A</div>
+            <div class="header-title">AI 助手</div>
+        </div>
+        <button class="new-chat-btn">+ 新对话</button>
+    </div>
+
+    <!-- 消息区域 -->
+    <div class="chat-container">
+        <!-- 用户消息 1 -->
+        <div class="message">
+            <div class="message-time">今天 14:23</div>
+            <div class="message-user">
+                <div class="bubble">你好，帮我介绍一下你自己</div>
+            </div>
+        </div>
+
+        <!-- AI 回复 1 -->
+        <div class="message">
+            <div class="message-ai">
+                <div class="avatar">A</div>
+                <div class="content-wrapper">
+                    <div class="bubble">
+                        你好！我是 AI 助手，基于 AgentScope 框架开发，可以帮你回答问题、执行任务、检索记忆等。<br><br>
+                        我支持多轮对话，能够理解上下文，并在需要时调用工具获取实时信息。请问有什么我可以帮你的？
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 用户消息 2 -->
+        <div class="message">
+            <div class="message-time">今天 14:24</div>
+            <div class="message-user">
+                <div class="bubble">帮我查一下今天广州的天气</div>
+            </div>
+        </div>
+
+        <!-- AI 回复 2（工具调用中） -->
+        <div class="message">
+            <div class="message-ai">
+                <div class="avatar">A</div>
+                <div class="content-wrapper">
+                    <div class="bubble">
+                        正在查询广州天气...<br>
+                        <span style="color: #D97757;">[工具调用中]</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- AI 回复 2（结果） -->
+        <div class="message">
+            <div class="message-ai">
+                <div class="avatar">A</div>
+                <div class="content-wrapper">
+                    <div class="bubble">
+                        广州今天天气：<br>
+                        ️ 晴，气温 22-28°C<br>
+                        💨 空气质量：优<br>
+                        👕 建议穿短袖，注意防晒
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 用户消息 3 -->
+        <div class="message">
+            <div class="message-time">今天 14:25</div>
+            <div class="message-user">
+                <div class="bubble">记住我喜欢喝奶茶</div>
+            </div>
+        </div>
+
+        <!-- AI 回复 3 -->
+        <div class="message">
+            <div class="message-ai">
+                <div class="avatar">A</div>
+                <div class="content-wrapper">
+                    <div class="bubble">
+                        ✅ 已记录：你喜欢喝奶茶。<br><br>
+                        这条记忆已保存到个人记忆库，下次对话时我会记得这个偏好。
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 输入框区域 -->
+    <div class="input-area">
+        <div class="input-wrapper">
+            <textarea class="input-box" placeholder="输入消息..." rows="1"></textarea>
+            <button class="send-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+            </button>
+        </div>
+        <div class="input-hint">按 Enter 发送，Shift + Enter 换行</div>
+    </div>
+</body>
+</html>
