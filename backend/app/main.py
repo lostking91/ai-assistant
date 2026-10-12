@@ -8,6 +8,8 @@
   GET  /api/sessions/{sid}/history 某会话的历史消息
   PATCH /api/sessions/{sid}        重命名会话
   DELETE /api/sessions/{sid}       删除会话
+  GET  /api/memory/link/blocked    已阻断待轮换的记忆链路会话列表
+  GET  /api/memory/link/{sid}      某会话的记忆链路状态（GM 会话代次）
 """
 
 import json
@@ -22,6 +24,7 @@ from pydantic import BaseModel
 
 from . import agent as agent_service
 from . import database as db
+from . import memory_link
 from .config import settings
 from .models import (
     ChatRequest,
@@ -173,6 +176,36 @@ async def history(session_id: str) -> SessionHistory:
         raise HTTPException(status_code=404, detail="会话不存在")
     title, messages = await agent_service.extract_history(session_id)
     return SessionHistory(session_id=session_id, title=title, messages=messages)
+
+
+# ------------------------------------------------------------------ 记忆链路观测
+
+# 说明：这两个端点用于观测 GM 会话级"顺序阻断"兼容机制（见 memory_link.py）的
+# 运行状态——本地会话当前映射到第几代 GM 会话、是否被标记阻断、有哪些会话待轮换。
+# 路由 /api/memory/link/blocked 必须定义在 /api/memory/link/{session_id} 之前，
+# 否则字面量 "blocked" 会被当作 session_id 吞掉。
+
+
+@app.get("/api/memory/link/blocked")
+async def memory_link_blocked() -> dict[str, Any]:
+    """列出所有已标记阻断、待轮换的本地会话（观测轮换机制健康度）。"""
+    rows = await memory_link.list_blocked()
+    return {"count": len(rows), "blocked_sessions": rows}
+
+
+@app.get("/api/memory/link/{session_id}")
+async def memory_link_status(session_id: str) -> dict[str, Any]:
+    """查询某本地会话的记忆链路状态：当前 GM 会话、代次、是否阻断。"""
+    link = await memory_link.link_status(session_id)
+    if link is None:
+        return {
+            "session_id": session_id,
+            "gm_session_id": None,
+            "generation": 0,
+            "blocked": False,
+            "note": "该会话尚未建立记忆链路映射（可能还没触发过记忆写入）。",
+        }
+    return link
 
 
 if __name__ == "__main__":

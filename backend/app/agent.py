@@ -32,6 +32,7 @@ from agentscope.state import AgentState
 
 from . import database as db
 from . import memory_client
+from . import memory_link
 from . import memory_retriever
 from .config import settings
 from .tools import build_toolkit
@@ -128,10 +129,19 @@ async def _build_agent(
     """构建智能体实例。
 
     AgentScope 2.x 中 toolkit 需要 async 注册，故此处为协程。
-    session_id 用于注册 save_memory 工具（GM 会话绑定契约）。
+    session_id 用于注册 save_memory 工具（GM 会话绑定契约）；投递前先经
+    memory_link.resolve_gm_session 解析出当前健康的 GM 会话 ID（若链路被顺序阻断，
+    此处会自动轮换），连同本地 session_id 一并注入 save_memory 闭包。
     memory_block 为本轮检索到的长期记忆（已渲染），拼进 system_prompt。
     """
-    toolkit = await build_toolkit(session_id=session_id)
+    gm_session_id = None
+    if session_id:
+        try:
+            gm_session_id = await memory_link.resolve_gm_session(session_id)
+        except Exception as exc:  # noqa: BLE001 - 解析失败降级为本地 session_id，不阻断对话
+            logger.warning("解析 GM 会话失败，回退为本地 session_id：%s", exc)
+            gm_session_id = session_id
+    toolkit = await build_toolkit(session_id=session_id, gm_session_id=gm_session_id)
     return Agent(
         name=settings.agent_name,
         system_prompt=build_system_prompt(memory_block),

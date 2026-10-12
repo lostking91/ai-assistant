@@ -41,6 +41,24 @@ class Settings(BaseSettings):
     gm_user_id: str = "gm_user_lw"
     gm_wait_timeout_ms: int = 15000
 
+    # ---- 记忆链路守护（GM 会话级顺序阻断的兼容对策） ----
+    # GM worker 对同一会话有顺序保护：某任务终态为 failed/partial/cancelled 后，
+    # 该会话后续所有抽取任务直接判 PRIOR_TASK_FAILED（不执行）。partial 不会自动
+    # 清理 => 一次抽取失败会让该会话记忆写入永久停摆（实测 2026-10-12 batch 7 卡链）。
+    # 对策：检测到 PRIOR_TASK_FAILED 时，为本地会话轮换新的 GM 会话 ID 并重投；
+    # 真实抽取失败的毒消息则隔离（quarantined）不再重投。GM 冻结不改，全部在本地实现。
+    memory_link_guard_enabled: bool = True
+    # 单个本地会话最多轮换次数（防无限轮换烧 LLM 调用；超限后标 blocked 停投并告警）
+    memory_link_max_generation: int = 5
+    # 单条发件最多因轮换重投次数
+    memory_link_max_rotate_per_item: int = 3
+    # 投递后任务终态校验：轮询间隔与总时间预算（校验在后台进行，不阻塞对话）。
+    # 实测 GM 单条抽取需 3-8s（含 LLM 调用），预算太短会拿不到终态、把真毒消息
+    # 误当受害者反复轮换，故默认给足 30s。预算耗尽仍有在途任务时直接放弃本轮，
+    # 残留发件留待下一次 flush/重启补投时再校验（幂等，无副作用）。
+    memory_task_verify_interval_s: float = 2.0
+    memory_task_verify_budget_s: float = 30.0
+
     # ---- GeneralMemory 记忆服务（读取侧 / 本地向量检索） ----
     # 说明：GM 的 POST /api/v1/memories:search 硬编码了 LLM 适用性判定（实测 6.5-9s），
     # 无法关闭；GM 源码冻结不改。故读取侧直连 GM 的 PostgreSQL 自行做向量检索，
