@@ -41,43 +41,47 @@ class Settings(BaseSettings):
     gm_user_id: str = "gm_user_lw"
     gm_wait_timeout_ms: int = 15000
 
-    # ---- 记忆链路守护（GM 会话级顺序阻断的兼容对策） ----
-    # GM worker 对同一会话有顺序保护：某任务终态为 failed/partial/cancelled 后，
-    # 该会话后续所有抽取任务直接判 PRIOR_TASK_FAILED（不执行）。partial 不会自动
-    # 清理 => 一次抽取失败会让该会话记忆写入永久停摆（实测 2026-10-12 batch 7 卡链）。
-    # 对策：检测到 PRIOR_TASK_FAILED 时，为本地会话轮换新的 GM 会话 ID 并重投；
-    # 真实抽取失败的毒消息则隔离（quarantined）不再重投。GM 冻结不改，全部在本地实现。
-    memory_link_guard_enabled: bool = True
-    # 单个本地会话最多轮换次数（防无限轮换烧 LLM 调用；超限后标 blocked 停投并告警）
-    memory_link_max_generation: int = 5
-    # 单条发件最多因轮换重投次数
-    memory_link_max_rotate_per_item: int = 3
-    # 投递后任务终态校验：轮询间隔与总时间预算（校验在后台进行，不阻塞对话）。
-    # 实测 GM 单条抽取需 3-8s（含 LLM 调用），预算太短会拿不到终态、把真毒消息
-    # 误当受害者反复轮换，故默认给足 30s。预算耗尽仍有在途任务时直接放弃本轮，
-    # 残留发件留待下一次 flush/重启补投时再校验（幂等，无副作用）。
+    # ---- 记忆写入侧的任务终态观测（原"记忆链路守护"，2026-10-15 精简为纯观测） ----
+    # 历史背景：GM v2.4.0 worker 对同一会话有顺序保护——某任务终态 failed/partial/
+    # cancelled 后，该会话后续抽取任务全部判 PRIOR_TASK_FAILED，写入永久停摆
+    # （实测 2026-10-12 batch 7 卡链），故本地曾实现"轮换 GM 会话 + 重投/隔离"对策
+    # （memory_link.py，已删除）。
+    # 现状：GM v2.6.0 提交 a43b3ad 已从根上修复——worker.py 中 PRIOR_TASK_FAILED
+    # 已完全移除，失败终态不再传播给后续任务（reports/add_context_validation.md：
+    # "重试耗尽且租约过期的前序任务由 Add Worker 收尾，后续任务成功执行"）。
+    # 因此只保留投递后的终态轮询观测（failed 仅记日志写回 outbox，不重投不轮换）。
+    # 轮询间隔与总时间预算：实测 GM 单条抽取需 3-8s（含 LLM 调用），预算太短会
+    # 拿不到终态；预算耗尽仍有在途任务时直接放弃本轮，残留发件留待下一次
+    # flush/重启补投时再校验（幂等，无副作用）。
     memory_task_verify_interval_s: float = 2.0
     memory_task_verify_budget_s: float = 30.0
 
-    # ---- GeneralMemory 记忆服务（读取侧 / 本地向量检索） ----
-    # 说明：GM 的 POST /api/v1/memories:search 硬编码了 LLM 适用性判定（实测 6.5-9s），
-    # 无法关闭；GM 源码冻结不改。故读取侧直连 GM 的 PostgreSQL 自行做向量检索，
-    # 相关性判断交给对话模型本身（注入 system_prompt）。详见 app/memory_retriever.py。
+    # ---- GeneralMemory 记忆服务（读取侧） ----
+    # 历史：GM v2.4.0 的 POST /api/v1/memories:search 硬编码 LLM 适用性判定（实测
+    # 6.5-9.1s 无法关闭），故当时直连 GM PostgreSQL 自建向量检索（memory_retriever.py）。
+    # 现状：GM v2.6.0 起 search 支持 use_model=false（提交 031ea68），关闭后纯向量
+    # 检索，稳态 0.46-0.56s；与自建检索做过 7 组真实 query 等价性实测——返回 ID
+    # 序列逐位完全一致（7/7 EXACT）。故默认切 GM API，自建直连保留为回退。
+    # 后端选择：gm_api=调 GM HTTP API（推荐）；local=直连 GM Postgres 自建检索。
+    memory_read_backend: str = "gm_api"
     memory_read_enabled: bool = True
-    # GM 的 Postgres 连接串（可沿用 GM .env 的 MEMORY_DATABASE_URL，
+    # GM 的 Postgres 连接串（仅 local 后端使用；可沿用 GM .env 的 MEMORY_DATABASE_URL，
     # postgresql+psycopg:// 方言会被自动规范化；localhost 会自动改 127.0.0.1 避免 IPv6 拖慢）
     gm_db_url: str = ""
     gm_tenant_id: str = "cmic-yun"
-    # embedding 必须与 GM 写入侧同模型，否则向量不可比
+    # embedding 必须与 GM 写入侧同模型，否则向量不可比（仅 local 后端使用；
+    # gm_api 后端由 GM 服务端自行向量化，无需本地配置）
     gm_embedding_api_key: str = ""
     gm_embedding_base_url: str = "https://api.siliconflow.cn/v1"
     gm_embedding_model: str = "BAAI/bge-m3"
     memory_read_limit: int = 5
     memory_read_scene_top_k: int = 3
     memory_read_timeout_ms: int = 2500
-    # 余弦距离上限，超过视为不相关直接丢弃（实测相关命中 0.21，无关噪声 0.47+）
+    # 余弦距离上限，超过视为不相关直接丢弃（实测相关命中 0.21，无关噪声 0.47+）。
+    # 仅 local 后端生效：GM API 的 SearchResponse 只返回 id/memory/cognitive_type，
+    # 不含 distance，调用侧无法做距离截断（相关性判断交给对话模型，prompt 已注入规则）。
     memory_read_max_distance: float = 0.62
-    # 是否复刻 GM 的证据链校验（关闭可再省 ~50ms，但可能召回已失效证据的记忆）
+    # 是否复刻 GM 的证据链校验（仅 local 后端生效；GM API 恒开 validate_user_evidence）
     memory_read_validate_evidence: bool = True
     # 短于该字符数不检索（"你好""继续"这类无检索价值）
     memory_read_min_query_chars: int = 2

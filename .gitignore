@@ -38,6 +38,15 @@ backend/data/
 *.sqlite3
 *.db-journal
 
+# ============ vendored skill ============
+# backend/skills/ 下的第三方 skill 包本身要提交（是运行依赖），
+# 但其运行时产物与凭据一律不入库：
+# 139邮箱授权凭据默认落在 ~/139mail/（仓库外），此处再兜一层防止被改到项目内。
+backend/skills/**/auth_info*.json
+backend/skills/**/.confirm_token.json
+backend/skills/**/*.bin
+backend/skills/**/__pycache__/
+
 # ============ 日志 ============
 *.log
 logs/

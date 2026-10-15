@@ -27,6 +27,40 @@ const resumeFlag = ref(false)
 
 let abortController = null
 
+// ------------------------------------------------------------------ 流式 delta 合帧
+// qwen-plus 流式每秒可产出数十个 delta，而每条 AI 消息渲染都要走
+// marked 解析 + DOMPurify 消毒 + highlight.js 高亮，逐个 delta 同步刷新会明显掉帧。
+// 因此把同一帧内到达的 delta 合并为一次写入（≈60fps），观感仍是逐字流出。
+let streamTarget = null // 当前正在流式填充的消息（必须是 reactive proxy，见 onSend）
+let pendingText = ''
+let rafId = 0
+
+function applyPending() {
+  if (!streamTarget || !pendingText) return
+  streamTarget.content += pendingText
+  pendingText = ''
+}
+
+/** 取消待执行的 rAF 并立即写入残余文本（done / error / 用户停止时调用，幂等） */
+function flushDelta() {
+  if (rafId) {
+    cancelAnimationFrame(rafId)
+    rafId = 0
+  }
+  applyPending()
+}
+
+function onTextDelta(text) {
+  if (!text) return
+  pendingText += text
+  if (!rafId) {
+    rafId = requestAnimationFrame(() => {
+      rafId = 0
+      applyPending()
+    })
+  }
+}
+
 // ------------------------------------------------------------------ 工具函数
 function nowTime() {
   const d = new Date()
@@ -115,6 +149,9 @@ function stopStreaming() {
     abortController.abort()
     abortController = null
   }
+  // 把已收到但未渲染的残余文本落盘，避免用户点"停止"后丢字
+  flushDelta()
+  streamTarget = null
   loading.value = false
   // 结束当前流式气泡的 streaming 状态
   const last = messages.value[messages.value.length - 1]
@@ -136,18 +173,23 @@ async function onSend(text) {
   })
 
   // 2) 插入占位的 AI 消息（流式填充）
-  const aiMsg = {
+  messages.value.push({
     role: 'assistant',
     content: '',
     timestamp: nowTime(),
     streaming: true,
     toolCalls: [],
     error: '',
-  }
-  messages.value.push(aiMsg)
+  })
+  // 关键：必须取回数组里的 reactive proxy 再修改。
+  // 若直接改 push 进去的原始对象，Vue 3 追踪不到，delta 不会触发重渲染
+  // （表现为"不是流式"：光标一直闪、文字不增长，直到 done 才一次性出现）。
+  const aiMsg = messages.value[messages.value.length - 1]
 
   loading.value = true
   abortController = new AbortController()
+  streamTarget = aiMsg
+  pendingText = ''
 
   try {
     await chatStream(
@@ -163,6 +205,7 @@ async function onSend(text) {
           resumeFlag.value = false
         },
         onToolStart: (ev) => {
+          flushDelta()
           aiMsg.toolCalls.push({ name: ev.name, state: '' })
         },
         onToolResult: (ev) => {
@@ -170,14 +213,19 @@ async function onSend(text) {
           if (t) t.state = ev.state || 'done'
         },
         onDelta: (ev) => {
-          aiMsg.content += ev.text || ''
+          onTextDelta(ev.text)
         },
-        onDone: () => {
+        onDone: (ev) => {
+          flushDelta()
+          // 兜底校正：done 事件带后端拼接的完整 reply，
+          // 若流式过程中有任何 delta 丢失/被中断，这里一次性补齐。
+          if (ev?.reply && ev.reply !== aiMsg.content) aiMsg.content = ev.reply
           aiMsg.streaming = false
           loading.value = false
           loadSessions()
         },
         onError: (msg) => {
+          flushDelta()
           aiMsg.streaming = false
           aiMsg.error = msg || '对话失败'
           loading.value = false
@@ -187,13 +235,17 @@ async function onSend(text) {
     )
   } catch (e) {
     if (e.name === 'AbortError') {
+      flushDelta()
       aiMsg.streaming = false
     } else {
+      flushDelta()
       aiMsg.streaming = false
       aiMsg.error = e.message || '请求失败'
       console.error(e)
     }
   } finally {
+    flushDelta()
+    streamTarget = null
     loading.value = false
     abortController = null
   }

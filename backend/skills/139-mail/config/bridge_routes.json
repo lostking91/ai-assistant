@@ -1,0 +1,231 @@
+{
+  "user:getScope": {
+    "description": "查询用户当前已授权的功能范围（无需业务权限，未授权时返回空）",
+    "moduleName": "mclaw",
+    "methodName": "getScope",
+    "contentType": "application/xml",
+    "responseFormat": "json",
+    "defaultBody": "<object></object>"
+  },
+  "user:getMainData": {
+    "description": "获取用户主数据信息（包括默认发件人等账户信息）",
+    "scope": "accountRead",
+    "eventName": "data_acquisition",
+    "moduleName": "setting",
+    "methodName": "getMainData",
+    "contentType": "application/xml",
+    "responseFormat": "json",
+    "defaultBody": "<object></object>"
+  },
+  "user:getAttrs": {
+    "description": "获取用户属性（包括全文检索开关 fts_flag）",
+    "scope": "mailManage",
+    "eventName": "user_attrs",
+    "moduleName": "webapp",
+    "methodName": "getUserAttrs",
+    "contentType": "application/xml",
+    "responseFormat": "js_like",
+    "defaultBody": "<object><array><string>fts_flag</string></array></object>"
+  },
+  "attach:upload2": {
+    "description": "上传邮件附件",
+    "scope": "mailSend",
+    "eventName": "upload_email_attachments",
+    "moduleName": "webapp",
+    "methodName": "uploadAttach",
+    "responseFormat": "text",
+    "timeoutSeconds": 60,
+    "useUploadPath": true
+  },
+  "attach:listAttachments": {
+    "description": "列出邮件附件（支持按附件名、主题等条件搜索）",
+    "scope": "mailManage",
+    "eventName": "email_attachment",
+    "moduleName": "webapp",
+    "methodName": "listAttachments",
+    "contentType": "application/xml;charset=UTF-8",
+    "responseFormat": "js_like"
+  },
+  "mbox:getComposeId": {
+    "description": "获取撰写邮件的唯一ID",
+    "scope": "mailSend",
+    "eventName": "compose_email",
+    "moduleName": "webapp",
+    "methodName": "composeId",
+    "contentType": "application/xml",
+    "responseFormat": "js_like",
+    "defaultBody": "<object></object>"
+  },
+  "mbox:compose": {
+    "description": "发送邮件（支持附件）",
+    "scope": "mailSend",
+    "eventName": "send_email",
+    "moduleName": "webapp",
+    "methodName": "sendMail",
+    "contentType": "application/xml;charset=UTF-8",
+    "responseFormat": "js_like"
+  },
+  "mbox:searchMessages": {
+    "description": "搜索邮件（支持关键词、发件人、时间范围等条件）",
+    "scope": "mailManage",
+    "eventName": "search_mail",
+    "moduleName": "bmail",
+    "methodName": "searchMessage",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:getMessageInfo": {
+    "description": "批量查询邮件基础信息（用于待办关联邮件补全）",
+    "scope": "mailManage",
+    "eventName": "email_detail",
+    "moduleName": "webapp",
+    "methodName": "getMessageInfo",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:restoreDraft": {
+    "description": "恢复草稿详情（用于读取草稿内容）",
+    "scope": "mailSend",
+    "eventName": "draft_email",
+    "moduleName": "webapp",
+    "methodName": "restoreDraft",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:readMessage": {
+    "description": "读取邮件详情（包括正文、附件等完整信息）",
+    "scope": "mailManage",
+    "eventName": "view_email_details",
+    "moduleName": "webapp",
+    "methodName": "readMessage",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:getAllFolders": {
+    "description": "获取所有邮件文件夹列表（用于移动邮件时选择目标文件夹）",
+    "scope": "mailManage",
+    "eventName": "search_folders_tags",
+    "moduleName": "webapp",
+    "methodName": "getAllFolders",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:moveMessages": {
+    "description": "移动邮件到指定文件夹",
+    "scope": "mailManage",
+    "eventName": "move_to_folder",
+    "moduleName": "webapp",
+    "methodName": "moveMessages",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:updateMessagesLabel": {
+    "description": "更新邮件标签（添加或移除标签）",
+    "scope": "mailManage",
+    "eventName": "update_email_labels",
+    "moduleName": "webapp",
+    "methodName": "updateMessagesLabel",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "mbox:updateMessagesStatus": {
+    "description": "更新邮件状态（标记已读/未读、加星/取消星标）",
+    "scope": "mailManage",
+    "eventName": "update_email_status",
+    "moduleName": "webapp",
+    "methodName": "updateMessageStatus",
+    "contentType": "application/xml",
+    "responseFormat": "js_like"
+  },
+  "contacts:mergeFuzzyQuery": {
+    "description": "联系人模糊查询（支持按姓名、邮箱等关键词搜索）",
+    "scope": "contactsRead",
+    "eventName": "contacts_fuzzy_search",
+    "moduleName": "addrsvr3",
+    "methodName": "MergeFuzzyQuery",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "contacts:getContactsList": {
+    "description": "获取联系人列表",
+    "scope": "contactsRead",
+    "eventName": "contacts_List",
+    "moduleName": "addrsvr",
+    "methodName": "GetContactsList",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "calendar:addNewUnifyCalendar": {
+    "description": "添加新的日历事件或待办事项",
+    "scope": "calendarManage",
+    "eventName": "add_schedule",
+    "moduleName": "calendar",
+    "methodName": "addNewUnifyCalendar",
+    "contentType": "application/xml",
+    "responseFormat": "text"
+  },
+  "calendar:searchCalendars": {
+    "description": "按标题关键词搜索日历事件和待办事项",
+    "scope": "calendarManage",
+    "eventName": "calendar_search",
+    "moduleName": "calendar",
+    "methodName": "searchCalendars",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "calendar:getMessageList": {
+    "description": "获取日历消息列表",
+    "scope": "calendarManage",
+    "eventName": "calendar_reminder",
+    "moduleName": "calendar",
+    "methodName": "getMessageList",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "calendar:getCalendarView": {
+    "description": "按时间范围获取日历视图中的事件和待办事项（支持 startDate/endDate 日期范围）",
+    "scope": "calendarManage",
+    "eventName": "calendar_details_view",
+    "moduleName": "calendar",
+    "methodName": "getCalendarView",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "calendar:getCalendar": {
+    "description": "获取日历事件或待办事项的详细信息",
+    "scope": "calendarManage",
+    "eventName": "calendar_details",
+    "moduleName": "calendar",
+    "methodName": "getCalendar",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "disk:getDirectLink": {
+    "description": "获取网盘文件的直链地址",
+    "scope": "mailSend",
+    "eventName": "access_attachment",
+    "moduleName": "diskmw",
+    "methodName": "getDirectLink",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "disk:getFile": {
+    "description": "获取网盘文件信息",
+    "scope": "mailManage",
+    "eventName": "cloud_drive_details",
+    "moduleName": "diskmw",
+    "methodName": "getFile",
+    "contentType": "application/xml",
+    "responseFormat": "json"
+  },
+  "download:attach": {
+    "description": "下载邮件附件",
+    "scope": "mailManage",
+    "eventName": "email_attachment_download",
+    "moduleName": "download",
+    "methodName": "attach",
+    "contentType": "application/json",
+    "responseFormat": "text",
+    "downloadBaseUrlRequired": true
+  }
+}

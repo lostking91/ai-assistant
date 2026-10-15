@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUpdated, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, onUpdated, ref, watch } from 'vue'
 import { renderMarkdown, highlightStreaming } from '@/utils/markdown'
 
 const props = defineProps({
@@ -37,18 +37,75 @@ function stateLabel(state) {
   return STATE_LABELS[String(state).toLowerCase()] || state
 }
 
-// 用户消息按纯文本渲染，AI 消息渲染 Markdown
-const html = computed(() =>
-  isUser.value ? '' : renderMarkdown(props.content),
+// ---- Markdown 渲染节流 ----
+// 流式期间 content 每帧都在变，而 renderMarkdown 要跑 marked 解析 + DOMPurify 消毒，
+// 成本随文本长度线性增长；逐帧全量重渲染会让长回复变成 O(n²) 并明显掉帧。
+// 因此流式中最多每 RENDER_INTERVAL_MS 重渲一次，定稿时立即渲染最终内容。
+const RENDER_INTERVAL_MS = 90
+const throttled = ref(props.content)
+let lastRender = 0
+let timer = null
+
+watch(
+  () => props.content,
+  (val) => {
+    if (!props.streaming) {
+      // 定稿（含历史消息、done 校正）：立即同步，保证最终内容一字不差
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      throttled.value = val
+      return
+    }
+    const now = Date.now()
+    const wait = RENDER_INTERVAL_MS - (now - lastRender)
+    if (wait <= 0) {
+      lastRender = now
+      throttled.value = val
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        timer = null
+        lastRender = Date.now()
+        throttled.value = props.content
+      }, wait)
+    }
+  },
 )
 
+watch(
+  () => props.streaming,
+  (streaming) => {
+    if (!streaming) {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      lastRender = 0
+      throttled.value = props.content
+    }
+  },
+)
+
+onUnmounted(() => {
+  if (timer) clearTimeout(timer)
+})
+
+// 用户消息按纯文本渲染，AI 消息渲染 Markdown
+const html = computed(() => (isUser.value ? '' : renderMarkdown(throttled.value)))
+
 function highlight() {
+  // 流式过程中跳过代码高亮：未闭合的代码块每帧全量重算，既昂贵又会闪烁；
+  // 等 streaming 变 false 后一次性高亮即可。
+  if (props.streaming) return
   nextTick(() => highlightStreaming(bodyRef.value))
 }
 
 onMounted(highlight)
 onUpdated(highlight)
-watch(() => props.content, highlight)
+// 渲染内容变化 / 流式结束（内容已定稿）时补高亮
+watch(throttled, highlight)
+watch(() => props.streaming, highlight)
 </script>
 
 <template>

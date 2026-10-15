@@ -9,6 +9,7 @@ import operator
 from contextlib import redirect_stderr, redirect_stdout
 
 from agentscope.message import TextBlock
+from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import FunctionTool, Toolkit, ToolChunk
 
 logger = logging.getLogger(__name__)
@@ -190,8 +191,8 @@ def python_interpreter(code: str) -> ToolChunk:
 # ---------------------------------------------------------------- save_memory 工具
 
 
-def _make_save_memory(session_id: str, gm_session_id: str):
-    """闭包注入本地 session_id 与当前 GM 会话 ID，返回 async save_memory 工具函数。
+def _make_save_memory(session_id: str):
+    """闭包注入本地 session_id（同时作为 GM 会话 ID），返回 async save_memory 工具函数。
 
     契约（GM 文档 T19 硬性要求）：
     - wait_for_result=true 同步等待抽取结果；
@@ -199,12 +200,11 @@ def _make_save_memory(session_id: str, gm_session_id: str):
     - succeeded + results 空 => "已收到但未形成新记忆"（重复事实），不得声称保存成功；
     - pending/failed => 如实报告，不承诺成功。
 
-    链路兼容（见 memory_link.py）：wait_for_result=true 会同步拿到终态。若返回
-    PRIOR_TASK_FAILED（GM 会话被顺序阻断），说明本地会话的 GM 链路已停摆——此时
-    轮换出新一代 GM 会话并就地重试一次，让用户"明确要求记住"的诉求尽量当场达成。
+    历史注：曾因 GM 会话级"顺序阻断"（PRIOR_TASK_FAILED 传播）在此做过
+    会话轮换就地重试；GM v2.6.0(a43b3ad) 已修复——失败终态不再传播给
+    后续任务，该兼容逻辑随 memory_link 模块一并移除。
     """
     from .. import memory_client
-    from .. import memory_link
     from ..config import settings
 
     # GM 抽取治理要求每条事实标注业务适用范围（scope_known）。
@@ -217,31 +217,6 @@ def _make_save_memory(session_id: str, gm_session_id: str):
         "（范围说明：这是用户本人的信息。若内容未注明特定业务场景或项目限定，"
         "视为通用个人信息；若内容本身写明场景或项目限定条件，按该限定标注，不要泛化。）"
     )
-
-    async def _attempt(target_gm_session: str, text: str, ts: str):
-        """向指定 GM 会话发起一次同步保存，返回 (task, error_exc)。"""
-        messages = [
-            memory_client.build_message(
-                "user",
-                _SAVE_MEMORY_TEMPLATE.format(text=text),
-                memory_client.new_message_id(),
-                ts,
-            ),
-        ]
-        payload = memory_client.build_add_payload(
-            target_gm_session,
-            messages,
-            wait_for_result=True,
-            wait_timeout_ms=settings.gm_wait_timeout_ms,
-        )
-        idem = memory_client.new_idempotency_key()
-        try:
-            task = await memory_client.add_memories(
-                payload, idem, timeout=settings.gm_wait_timeout_ms / 1000 + 10
-            )
-            return task, None
-        except memory_client.MemoryClientError as exc:
-            return None, exc
 
     async def save_memory(content: str) -> ToolChunk:
         """把用户明确要求记住的信息保存到长期记忆（GeneralMemory 服务）。
@@ -260,27 +235,27 @@ def _make_save_memory(session_id: str, gm_session_id: str):
         if not text:
             return _text_chunk("保存失败：内容为空。")
 
-        # 解析当前健康 GM 会话（若链路已标记阻断，这里会自动轮换）
-        if settings.memory_link_guard_enabled:
-            target_gm = await memory_link.resolve_gm_session(session_id)
-        else:
-            target_gm = gm_session_id or session_id
-
-        ts = memory_client.now_iso()
-        task, exc = await _attempt(target_gm, text, ts)
-
-        # 同步拿到 PRIOR_TASK_FAILED：轮换到新 GM 会话后就地重试一次
-        if task is not None and memory_link.is_victim(task):
-            logger.warning(
-                "save_memory 命中顺序阻断 gm_session=%s，轮换后重试一次", target_gm
+        messages = [
+            memory_client.build_message(
+                "user",
+                _SAVE_MEMORY_TEMPLATE.format(text=text),
+                memory_client.new_message_id(),
+                memory_client.now_iso(),
+            ),
+        ]
+        payload = memory_client.build_add_payload(
+            session_id,
+            messages,
+            wait_for_result=True,
+            wait_timeout_ms=settings.gm_wait_timeout_ms,
+        )
+        idem = memory_client.new_idempotency_key()
+        task = None
+        try:
+            task = await memory_client.add_memories(
+                payload, idem, timeout=settings.gm_wait_timeout_ms / 1000 + 10
             )
-            new_gm = await memory_link.rotate_session(session_id, target_gm)
-            if new_gm and new_gm != target_gm:
-                task2, exc2 = await _attempt(new_gm, text, memory_client.now_iso())
-                if task2 is not None or exc2 is not None:
-                    task, exc = task2, exc2
-
-        if exc is not None:
+        except memory_client.MemoryClientError as exc:
             logger.warning("save_memory 调用失败：%s", exc)
             if exc.retryable:
                 return _text_chunk(
@@ -319,17 +294,13 @@ def _make_save_memory(session_id: str, gm_session_id: str):
 # ---------------------------------------------------------------- 注册
 
 
-async def build_toolkit(
-    session_id: str | None = None,
-    gm_session_id: str | None = None,
-) -> Toolkit:
+async def build_toolkit(session_id: str | None = None) -> Toolkit:
     """构建并返回已注册全部工具的 Toolkit。
 
     Args:
-        session_id: 当前本地会话 ID。提供且记忆功能启用时，注册 save_memory 工具
-            （GM 契约要求 session 绑定，工具需要会话上下文）。
-        gm_session_id: 当前解析出的健康 GM 会话 ID（见 memory_link.resolve_gm_session）。
-            与 session_id 一同注入 save_memory 闭包；缺省时回退为 session_id。
+        session_id: 当前本地会话 ID（同时作为 GM 会话 ID）。提供且记忆功能
+            启用时，注册 save_memory 工具（GM 契约要求 session 绑定，工具
+            需要会话上下文）。
     """
     toolkit = Toolkit()
     await toolkit.add_tool(
@@ -353,8 +324,26 @@ async def build_toolkit(
             func=python_interpreter,
             name="python_interpreter",
             description="在受限沙箱中执行 Python 代码并返回输出结果",
+            # 显式声明 ALLOW：DEFAULT 权限模式下，未标 is_read_only 且未传
+            # permission 的 FunctionTool 会被判 ASK，工具执行被挂起等待人工确认；
+            # 而前端没有确认入口，表现为"卡死"（只发 tool_start 不发 tool_result）。
+            # 这里不用 is_read_only=True 是因为执行代码语义上并非只读；
+            # 安全性由沙箱自身保证（_BLOCKED_BUILTINS 已封禁 open/exec/eval/
+            # compile/__import__/input 等高危内建）。
+            permission=PermissionDecision(
+                behavior=PermissionBehavior.ALLOW,
+                message="受限沙箱内执行 Python 代码，高危内建已封禁，默认放行。",
+            ),
         )
     )
+
+    # mail139：139邮箱 Skill 适配层（vendored 官方脚本 + 子进程调用）。
+    # 权限声明见 mail139.build_mail139_tool 的 docstring：显式 ALLOW，
+    # 写操作安全性由 skill 的 confirm_token 两步确认 + 适配层 flag 黑名单保证。
+    from .mail139 import build_mail139_tool, mail139_available
+
+    if mail139_available():
+        await toolkit.add_tool(build_mail139_tool())
 
     # save_memory：需要会话上下文（GM session 绑定），且记忆功能已启用才注册
     if session_id:
@@ -363,7 +352,7 @@ async def build_toolkit(
         if memory_client.memory_enabled():
             await toolkit.add_tool(
                 FunctionTool(
-                    func=_make_save_memory(session_id, gm_session_id or session_id),
+                    func=_make_save_memory(session_id),
                     name="save_memory",
                     description="把用户明确要求记住的信息保存到长期记忆服务",
                     # 用户已明确要求记住=已授权，且不动本地文件系统，

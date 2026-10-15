@@ -32,7 +32,6 @@ from agentscope.state import AgentState
 
 from . import database as db
 from . import memory_client
-from . import memory_link
 from . import memory_retriever
 from .config import settings
 from .tools import build_toolkit
@@ -52,9 +51,31 @@ BASE_SYSTEM_PROMPT = """你是一个友好、专业的中文 AI 助手，名字�
 - get_current_time：获取当前日期和时间。凡是涉及"今天""现在""本周"等时间概念，必须先调用此工具，不要凭猜测回答。
 - calculator：做数学计算。任何算术运算都应调用此工具，确保结果准确。
 - python_interpreter：执行 Python 代码，用于数据处理、复杂计算、字符串处理等。
+- mail139：操作 139 邮箱（139.com 中国移动官方邮箱），可搜索/阅读/发送邮件、
+  管理附件与草稿、标记整理邮件、查通讯录、管理日历待办。详见下方"# 139邮箱"。
 - save_memory：把用户明确要求记住的信息保存到长期记忆服务（GeneralMemory）。
 
 调用工具后，用自然语言把结果清晰地讲给用户，不要直接罗列原始输出。
+
+# 139邮箱
+1. **授权优先**：用户第一次让你处理邮箱、或任何邮件操作返回 AUTH_REQUIRED / AUTH_EXPIRED 时，
+   把工具给出的 message 与授权链接原样转达给用户，请其在浏览器完成授权后回复「已授权」。
+   不要刷新或编造授权链接，不要在用户确认前继续调用其它邮件操作，更不要编造授权结果。
+2. **会话首次**：先调 action=account 探一次授权状态；成功则在回复开头告知一次
+   "当前绑定的邮箱账号是：xxx"，同一会话不重复。拿不到账号就不要编造这行提示，也不阻断原任务。
+3. **列表查询必须真跑脚本**：用户问"有哪些邮件/附件/待办"时，必须调用 mail139 拿真实数据，
+   不能只答"有/没有"，也不能凭上下文猜测。只有返回 total_is_authoritative=true 且 total 为数字
+   才可以报总数；当前页条数、page_size 都不是总数。
+4. **发邮件必须两步确认**（不可逆动作，务必遵守）：
+   - 第一步：action=send，**不带** --confirmed，拿到草稿预览与 confirm_token；
+   - 把收件人、主题、正文、附件完整展示给用户，请其确认；
+   - 第二步：用户在**后续消息**里明确确认后，再带 --confirmed --confirm-token <token> 调一次。
+   - 用户一开始说的"直接发送/不用确认"不算确认。draft-send、calendar-add、move、
+     label-add 同样先展示完整变更、等用户后续确认再执行。
+5. **不要把内部 ID 念给用户**：mid/fid/seqNo/extmid/sid 只用于工具参数，
+   对用户只用序号或主题。列表结果末尾提示用户"如需查看详情，请告诉我序号或主题"。
+6. **能力边界**：不支持删除邮件、移入已删除/垃圾箱、移除或清空标签、密送(BCC)。
+   用户要求这些时如实说明不支持，不要绕道用别的参数试。
 
 # 记忆能力
 1. 当用户明确要求"记住某事"（如"记住我叫老王""以后记得我喜欢简洁表格"）时，
@@ -129,19 +150,12 @@ async def _build_agent(
     """构建智能体实例。
 
     AgentScope 2.x 中 toolkit 需要 async 注册，故此处为协程。
-    session_id 用于注册 save_memory 工具（GM 会话绑定契约）；投递前先经
-    memory_link.resolve_gm_session 解析出当前健康的 GM 会话 ID（若链路被顺序阻断，
-    此处会自动轮换），连同本地 session_id 一并注入 save_memory 闭包。
+    session_id 用于注册 save_memory 工具（GM 会话绑定契约），直接作为 GM
+    会话 ID 注入闭包——GM v2.6.0(a43b3ad) 起失败终态不再传播给后续任务，
+    会话级顺序阻断已不存在，无需再做会话轮换解析（memory_link 已移除）。
     memory_block 为本轮检索到的长期记忆（已渲染），拼进 system_prompt。
     """
-    gm_session_id = None
-    if session_id:
-        try:
-            gm_session_id = await memory_link.resolve_gm_session(session_id)
-        except Exception as exc:  # noqa: BLE001 - 解析失败降级为本地 session_id，不阻断对话
-            logger.warning("解析 GM 会话失败，回退为本地 session_id：%s", exc)
-            gm_session_id = session_id
-    toolkit = await build_toolkit(session_id=session_id, gm_session_id=gm_session_id)
+    toolkit = await build_toolkit(session_id=session_id)
     return Agent(
         name=settings.agent_name,
         system_prompt=build_system_prompt(memory_block),
@@ -266,7 +280,8 @@ async def _recall_memory_block(message: str) -> tuple[str, dict[str, Any]]:
             {
                 "content": m.content,
                 "cognitive_type": m.cognitive_type,
-                "similarity": round(m.similarity, 3),
+                # gm_api 后端无 distance，similarity 为 None
+                "similarity": round(m.similarity, 3) if m.similarity is not None else None,
             }
             for m in result.memories
         ],

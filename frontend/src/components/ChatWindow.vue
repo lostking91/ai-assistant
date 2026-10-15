@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import MessageBubble from './MessageBubble.vue'
 
 const props = defineProps({
@@ -14,6 +14,8 @@ const emit = defineEmits(['quick-send'])
 const scrollRef = ref(null)
 // 用户是否手动上滚（若上滚则不自动跟随底部）
 const stickToBottom = ref(true)
+// 是否有消息正在流式输出：流式时关闭平滑滚动，避免每帧重启动画造成抖动
+const isStreaming = computed(() => props.messages.some((m) => m.streaming))
 
 const suggestions = [
   { icon: '🕐', text: '现在几点了？' },
@@ -40,24 +42,30 @@ function scrollToBottom(force = false) {
   })
 }
 
-// 消息内容变化时自动滚动（流式输出时持续跟随）
-watch(
-  () => props.messages,
-  () => scrollToBottom(),
-  { deep: true },
-)
+// 流式跟随：只观察「消息条数 + 最后一条的文本长度」，
+// 替代对整个 messages 的 deep watch（deep 每帧都要遍历全部消息树，长会话下开销很大）
+const msgCount = computed(() => props.messages.length)
+// 末尾附 streaming 标记，使「内容长度不变但流式结束」这一跳变也能触发滚动
+const lastMsgProgress = computed(() => {
+  const last = props.messages[props.messages.length - 1]
+  return last ? last.content.length + (last.streaming ? 1 : 0) : 0
+})
+
+watch([msgCount, lastMsgProgress], () => scrollToBottom())
 
 // 切换会话导致消息数突变时强制到底
-watch(
-  () => props.messages.length,
-  () => scrollToBottom(true),
-)
+watch(msgCount, () => scrollToBottom(true))
 
 defineExpose({ scrollToBottom })
 </script>
 
 <template>
-  <div ref="scrollRef" class="chat-window" @scroll="onScroll">
+  <div
+    ref="scrollRef"
+    class="chat-window"
+    :class="{ 'chat-window--instant': isStreaming }"
+    @scroll="onScroll"
+  >
     <div class="chat-window__inner">
       <!-- 空状态欢迎页 -->
       <div v-if="!messages.length" class="welcome">
@@ -109,6 +117,11 @@ defineExpose({ scrollToBottom })
   overflow-y: auto;
   scroll-behavior: smooth;
   background-color: var(--color-bg);
+
+  // 流式输出时改为瞬时滚动：平滑动画会被每帧的滚动请求反复重启，导致视觉抖动
+  &--instant {
+    scroll-behavior: auto;
+  }
 
   &__inner {
     max-width: var(--content-max-width);

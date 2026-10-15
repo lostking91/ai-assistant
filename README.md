@@ -2,7 +2,19 @@
 
 基于 **AgentScope 2.x + FastAPI + Vue 3** 的对话式 AI 助手。后端运行 ReAct 智能体（通义千问 `qwen-plus`），前端为暖色现代风格（方案3 · Anthropic Custom）的聊天界面，支持流式输出、工具调用、Markdown 渲染、会话持久化与历史会话管理。
 
-> 本项目是「记忆服务集成」系列任务的载体：**任务1（AI 助手 Demo）已完成**；**任务2（GeneralMemory 写入侧接入）已完成**——新增 `save_memory` 工具 + 回合结束钩子两条写入路径，检索/召回按决策延后。详见[十二、GeneralMemory 记忆接入](#十二generalmemory-记忆接入任务2)与文末[后续规划](#十四后续规划)。
+> 本项目是「记忆服务集成」系列任务的载体：**任务1（AI 助手 Demo）已完成**；**任务2（GeneralMemory 接入）写入侧 + 读取侧均已完成**——写入走 `save_memory` 工具 + 回合结束钩子两条路径，读取走「每轮检索长期记忆并动态注入 system_prompt」的无工具召回。详见[十二、GeneralMemory 记忆接入](#十二generalmemory-记忆接入)与文末[后续规划](#十四后续规划)。
+
+### 版本：v1.2.0（2026-10-15）
+
+相对 v1.1.1 的三项主要改造：
+
+| # | 改造 | 内容 | 影响面 |
+|---|---|---|---|
+| 1 | **记忆读侧切 GM 官方 API** | 默认后端由「直连 GM Postgres 自建向量检索」改为调 GM `POST /api/v1/memories:search`（`use_model=false` 纯向量检索）；自建检索降级为可回退的 `local` 后端 | `memory_retriever.py`、`config.py` |
+| 2 | **移除记忆链路守护（memory_link）** | GM v2.6.0 提交 `a43b3ad` 已修复「前序任务失败导致会话级阻塞」，会话轮换/阻断检测失去存在意义 → 删除 313 行守护模块及其端点、建表 DDL、死配置；写侧精简为纯观测 | `memory_link.py`(删)、`agent.py`、`main.py`、`builtin_tools.py`、`database.py`、`config.py`、`memory_client.py` |
+| 3 | **集成 139 邮箱 Skill** | vendored 官方 skill 包（`backend/skills/139-mail/`）+ 适配层工具 `mail139`（子进程调用，flag 黑名单 + 两步确认） | `tools/mail139.py`(新)、`skills/`、`builtin_tools.py`、`requirements.txt`、`.gitignore` |
+
+> 附带：前端流式渲染性能优化（delta 合帧 + 渲染节流 + 滚动优化）与 Vue 3 响应式陷阱修复，见 [十三、常见问题排查](#十三常见问题排查)。
 
 ---
 
@@ -19,7 +31,7 @@
 - [九、数据库设计](#九数据库设计)
 - [十、内置工具](#十内置工具)
 - [十一、会话管理逻辑](#十一会话管理逻辑)
-- [十二、GeneralMemory 记忆接入（任务2）](#十二generalmemory-记忆接入任务2)
+- [十二、GeneralMemory 记忆接入](#十二generalmemory-记忆接入)
 - [十三、常见问题排查](#十三常见问题排查)
 - [十四、后续规划](#十四后续规划)
 - [附：UI 设计稿](#附ui-设计稿)
@@ -37,7 +49,7 @@
 │                      │  <────────────────────────  │                          │
 │  Element Plus UI     │      流式事件 (SSE)          │  AgentScope 2.x ReAct    │
 │  marked + hljs 渲染   │                             │   ├─ DashScope qwen-plus │
-└─────────────────────┘                             │   ├─ Toolkit（3+1 工具）  │
+└─────────────────────┘                             │   ├─ Toolkit（最多5工具） │
                                                      │   └─ AgentState 持久化    │
                                                      │            │             │
                                                      │            ▼             │
@@ -48,16 +60,18 @@
                                                                  ▼
                                                      ┌──────────────────────────┐
                                                      │  GeneralMemory (GM) 服务   │
-                                                     │  API :8001 + Worker(add)  │
+                                                     │  API :8001 + Worker×4角色  │
                                                      │  PostgreSQL :5433 (Docker)│
-                                                     │  memories:add / tasks 查询 │
+                                                     │  写:memories:add/读:search │
                                                      └──────────────────────────┘
 ```
 
 - **前后端独立部署**，通过 REST + SSE 通信。
 - 前端开发服务器用 **Vite 代理**把 `/api` 转发到 `http://127.0.0.1:8000`，规避跨域并让 SSE 正常工作。
 - 后端把 AgentScope 的 **`AgentState` 整体序列化**存入 SQLite，保留完整上下文与工具调用轨迹。
-- **记忆写入侧（任务2）**：两条路径写 GM——① `save_memory` 工具（用户明确要求记住，同步等结果）；② 回合结束钩子（每轮 user+assistant 消息，经本地 `memory_outbox` 表落库后异步投递，重启可重发）。详见[第十二章](#十二generalmemory-记忆接入任务2)。
+- **记忆写入侧**：两条路径写 GM——① `save_memory` 工具（用户明确要求记住，同步等结果）；② 回合结束钩子（每轮 user+assistant 消息，经本地 `memory_outbox` 表落库后异步投递，重启可重发）。
+- **记忆读取侧（v1.2.0 起走 GM 官方 API）**：每轮对话前调 GM `POST /api/v1/memories:search`（`use_model=false` 纯向量检索），把召回结果渲染进 `system_prompt` 动态注入；无 `search_memory` 工具（相关性判定交给对话模型本身，零额外延迟）。默认后端 `gm_api`，`local`（直连 GM Postgres 自建检索）保留为回退。详见[第十二章](#十二generalmemory-记忆接入)。
+- **GM 会话映射（v1.2.0 起简化）**：本地 `session_id` 直接作为 GM 会话 ID，读写两侧均不再做会话轮换/解析（原 memory_link 守护已随 GM `a43b3ad` 修复移除）。
 
 ### 技术选型
 
@@ -89,14 +103,20 @@ ai-assistant/
 │   └── app/
 │       ├── __init__.py
 │       ├── main.py               # FastAPI 入口，路由与 lifespan（启动时 flush outbox）
-│       ├── config.py             # 配置（读取 .env，含 GM 记忆配置项）
+│       ├── config.py             # 配置（读取 .env，含 GM 记忆读写配置项）
 │       ├── models.py             # 请求/响应 Pydantic 模型
-│       ├── agent.py              # AgentScope 智能体封装、会话管理、流式对话、回合记忆钩子
+│       ├── agent.py              # AgentScope 智能体封装、会话管理、流式对话、回合记忆钩子、记忆召回注入
 │       ├── database.py           # SQLite 持久化（sessions + memory_outbox）
 │       ├── memory_client.py      # GM 写入侧客户端（契约适配、outbox 投递、结果归纳）
+│       ├── memory_retriever.py   # GM 读取侧客户端（双后端 gm_api/local，向量检索+证据链，渲染 system_prompt 片段）
 │       └── tools/
 │           ├── __init__.py
-│           └── builtin_tools.py  # 4 个内置工具实现（含 save_memory）
+│           ├── builtin_tools.py  # 内置工具实现（get_current_time/calculator/python_interpreter/save_memory + mail139 装配）
+│           └── mail139.py        # 139邮箱 Skill 适配层（子进程调用 vendored 官方脚本，flag 黑名单+两步确认）
+│   ├── scripts/
+│   │   └── c_step_agent_id_test.py  # GM agent_id/source_system 过滤实测脚本（可重跑）
+│   └── skills/
+│       └── 139-mail/             # vendored 官方 139邮箱 Skill 包（运行依赖，凭据文件已 .gitignore）
 ├── frontend/                     # 前端（Vue 3 + Vite）
 │   ├── package.json              # 依赖与脚本
 │   ├── vite.config.js            # Vite 配置（@ 别名 + /api 代理）
@@ -126,7 +146,7 @@ ai-assistant/
 
 ## 三、功能清单
 
-### 已实现（任务1 + 任务2）
+### 已实现（任务1 + 任务2 + v1.2.0）
 
 | 功能               | 说明                                                       | 状态     |
 | ---------------- | -------------------------------------------------------- | ------ |
@@ -147,14 +167,17 @@ ai-assistant/
 | `save_memory` 工具 | 用户明确要求记住时，同步写入 GM 并按结果语义如实回复                             | ✅（任务2） |
 | 回合记忆钩子           | 每轮 user+assistant 消息经 outbox 异步写入 GM                     | ✅（任务2） |
 | outbox 可靠投递      | 先落 SQLite 再投递，幂等键重试，重启自动补发                               | ✅（任务2） |
+| 记忆召回注入           | 每轮对话前检索长期记忆并动态注入 system_prompt（v1.2.0 默认走 GM API）        | ✅（v1.2.0） |
+| `mail139` 工具     | 139邮箱 Skill：搜索/阅读/发送邮件、附件、日程、通讯录、网盘（vendored 官方包+适配层）  | ✅（v1.2.0） |
 
 ### 待实现（后续任务）
 
 | 功能                             | 所属任务      | 状态      |
 | ------------------------------ | --------- | ------- |
-| `search_memory` 记忆检索工具（检索/召回侧） | 任务2（延后部分） | ⏳ 按决策延后 |
-| 记忆管理平台                         | 任务3       | ⏳       |
-| 记忆服务插件化                        | 任务4       | ⏳       |
+| `gm-memory` MCP server（GM 官方暂缓 MCP，当前以 HTTP API 直调替代） | 任务4 | ⏳ |
+| 记忆管理平台                         | 任务3       | ⏳ 主体已在 memory-platform 项目落地 |
+
+> 原「任务2 延后项：检索/召回侧」已完成——采用**无工具召回**（每轮自动检索注入 system_prompt）而非 `search_memory` 工具，相关性判定交给对话模型本身，避免多一轮 LLM 往返。
 
 ---
 
@@ -182,7 +205,9 @@ ai-assistant/
 | pydantic-settings | 2.15.0  | 配置管理                     |
 | python-dotenv     | 1.2.4   | .env 解析                  |
 | dashscope         | 1.27.7  | 通义千问 SDK                 |
-| httpx             | ≥0.27   | GM 记忆服务 HTTP 客户端（任务2 新增） |
+| httpx             | 0.28.1  | GM 记忆服务 HTTP 客户端（读写两侧） |
+| psycopg           | 3.3.6   | 读侧 `local` 后端直连 GM Postgres（回退用） |
+| requests / cryptography / keyring | ≥2.31 / ≥42 / ≥25 | 139邮箱 Skill（vendored）依赖，v1.2.0 新增 |
 
 ### 前端 npm 包（`frontend/node_modules`）
 
@@ -337,16 +362,36 @@ npm run dev
 | `AGENT_NAME`              | `AI助手`                                        | 智能体名称                |
 | `MAX_ITERS`               | `20`                                          | ReAct 最大迭代轮数         |
 
-### 记忆服务配置（任务2 新增）
+### 记忆服务配置（写入侧）
 
 | 变量                   | 默认值                     | 说明                                                                         |
 | -------------------- | ----------------------- | -------------------------------------------------------------------------- |
 | `MEMORY_ENABLED`     | `true`                  | 记忆写入总开关。关闭后 `save_memory` 不注册、回合钩子不投递                                      |
-| `GM_BASE_URL`        | `http://127.0.0.1:8001` | GeneralMemory API 地址                                                       |
+| `GM_BASE_URL`        | `http://127.0.0.1:8001` | GeneralMemory API 地址（读写两侧共用）                                              |
 | `GM_TOKEN`           | （空）                     | ★GM Bearer Token，**为空则记忆功能整体禁用**（`memory_enabled()` 要求 token/base_url 均非空） |
 | `GM_SOURCE_SYSTEM`   | `ai_assistant`          | GM 侧的来源系统标识                                                                |
 | `GM_USER_ID`         | `gm_user_lw`            | GM 租户内用户 ID（当前租户 `cmic-yun`）                                               |
 | `GM_WAIT_TIMEOUT_MS` | `15000`                 | `save_memory` 同步等待抽取结果的超时（毫秒），HTTP 超时在此基础上 +10s                            |
+
+> **写侧不传 `agent_id`**（GM 会回落到凭证的 `caller_agent_id`，即 `ai_assistant`）；**读侧不传 `agent_id`/`source_system`**（跨 Agent 共享视角，符合个人助手定位）。经 v1.2.0 实测确认，详见 [12.7](#127-agent_id--source_system-过滤语义实测固化)。
+
+### 记忆服务配置（读取侧，v1.2.0 起生效）
+
+| 变量                        | 默认值                     | 说明                                                         |
+| ------------------------- | ----------------------- | ---------------------------------------------------------- |
+| `MEMORY_READ_BACKEND`     | `gm_api`                | 读侧后端：`gm_api`=调 GM HTTP search（推荐）；`local`=直连 GM Postgres 自建向量检索（回退用） |
+| `MEMORY_READ_ENABLED`     | `true`                  | 记忆召回总开关。关闭后不检索、不注入 system_prompt                            |
+| `MEMORY_READ_LIMIT`       | `5`                     | 召回条数上限（GM 侧 limit 合法区间 1-50）                              |
+| `MEMORY_READ_TIMEOUT_MS`  | `2500`                  | 单次检索超时；超时即降级为「本轮无记忆」，**绝不阻塞对话链路**                         |
+| `MEMORY_READ_MIN_QUERY_CHARS` | `2`                 | 用户输入短于该长度时跳过检索（无检索价值）                                     |
+| `GM_DB_URL`               | （空）                     | 仅 `local` 后端需要：GM PostgreSQL 连接串（只读）                        |
+| `GM_TENANT_ID`            | `cmic-yun`              | 仅 `local` 后端需要：租户 ID                                        |
+| `GM_EMBEDDING_*`          | SiliconFlow / `BAAI/bge-m3` | 仅 `local` 后端需要：本地向量化配置（`gm_api` 后端由 GM 服务端自行向量化）      |
+| `MEMORY_READ_MAX_DISTANCE` | `0.62`                 | 仅 `local` 后端生效：余弦距离截断阈值（`gm_api` 响应不含 distance，故不可用）        |
+| `MEMORY_READ_VALIDATE_EVIDENCE` | `true`            | 仅 `local` 后端生效：证据链完整性校验                                    |
+| `MEMORY_TASK_VERIFY_INTERVAL_S` / `_BUDGET_S` | `2.0` / `30.0` | 写侧任务终态观测（原「记忆链路守护」，v1.2.0 精简为**纯观测**：只记日志，不再轮换会话、不再阻断） |
+
+> **已删除的死配置**（v1.2.0）：`MEMORY_LINK_GUARD_ENABLED`、`MEMORY_LINK_MAX_GENERATION`、`MEMORY_LINK_MAX_ROTATE_PER_ITEM` —— 对应的会话轮换守护逻辑随 GM `a43b3ad` 修复一并移除。
 
 
 > `has_api_key` 判定逻辑：密钥非空且不以 `YOUR_` 开头才视为已配置。
@@ -400,11 +445,11 @@ npm run dev
   "status": "ok",
   "model": "qwen-plus",
   "api_key_configured": true,
-  "tools": ["get_current_time", "calculator", "python_interpreter"]
+  "tools": ["get_current_time", "calculator", "python_interpreter", "mail139"]
 }
 ```
 
-> 健康检查里的 `tools` 恒为 3 个基础工具：`save_memory` 只在有会话上下文（session_id）时才注册进 Toolkit，健康检查不绑定会话，属预期行为。
+> 健康检查不绑定会话，因此 `tools` 里**不含 `save_memory`**（该工具需 session_id 上下文才注册，属预期行为）；`mail139` 在 skill 目录就位时出现（`skills/139-mail/scripts/common.py` 存在）。
 
 **SessionItem（列表项）**：`{session_id, title, created_at, updated_at}`
 
@@ -460,16 +505,19 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 | 字段                          | 类型                       | 说明                                        |
 | --------------------------- | ------------------------ | ----------------------------------------- |
 | `id`                        | INTEGER PK AUTOINCREMENT | 自增主键                                      |
-| `session_id`                | TEXT                     | 所属会话                                      |
+| `session_id`                | TEXT                     | 所属会话（v1.2.0 起同时就是 GM 会话 ID）              |
 | `idempotency_key`           | TEXT UNIQUE              | GM 幂等键（UUID hex，1-128 ASCII）              |
 | `payload_json`              | TEXT                     | AddRequest 完整载荷（含 messages）               |
-| `status`                    | TEXT                     | `pending` / `sending` / `sent` / `failed` |
+| `status`                    | TEXT                     | `pending` / `sending` / `sent` / `failed`（存量行可能残留历史状态 `quarantined`） |
 | `attempts`                  | INTEGER                  | 已尝试次数                                     |
 | `task_id`                   | TEXT                     | 投递成功后 GM 返回的任务 ID                         |
+| `gm_task_status`            | TEXT                     | GM 侧任务终态观测值（`_verify_tasks` 轮询回写：null/pending/processing/succeeded/partial/failed/cancelled） |
 | `last_error`                | TEXT                     | 最近一次失败原因                                  |
+| `gm_session_id` / `rotate_count` | TEXT / INTEGER       | **历史遗留列**（会话轮换机制时期产物，v1.2.0 起不再使用，迁移保留） |
 | `created_at` / `updated_at` | TEXT                     | 时间戳                                       |
 
-- 索引：`idx_outbox_status(status, id)`，`flush_outbox` 按状态扫描待发件。
+- 索引：`idx_outbox_status(status, id)`（`flush_outbox` 按状态扫描待发件）、`idx_outbox_gm_session(gm_session_id, status)`（历史遗留）。
+- **表 `memory_link` 已移除（v1.2.0）**：原用于「本地会话→GM 会话映射」支撑阻断轮换守护，GM `a43b3ad` 修复后新库不再建此表；存量库中的表与数据保留不动（见 [12.8](#128-记忆链路守护memory_link移除说明v120)）。
 
 ---
 
@@ -481,16 +529,19 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 | -------------------- | ----------------- | --------------------------------------------- | ----------------------------------------------- |
 | `get_current_time`   | 无                 | 获取当前日期时间（东八区，含星期）                             | 只读                                              |
 | `calculator`         | `expression: str` | 计算数学表达式，支持四则、幂、取余及 `sqrt/log/sin/cos/round` 等 | **AST 白名单**求值，杜绝 `eval` 注入                      |
-| `python_interpreter` | `code: str`       | 受限沙箱执行 Python 代码，返回 stdout/stderr/异常          | **禁用高危内建**（`open/exec/eval/__import__/input` 等） |
-| `save_memory`        | `content: str`    | 把用户明确要求记住的信息同步保存到 GM 长期记忆（任务2 新增）             | 仅在**有会话上下文且记忆功能启用**时注册；标 `is_read_only` 走权限快速通道 |
+| `python_interpreter` | `code: str`       | 受限沙箱执行 Python 代码，返回 stdout/stderr/异常          | **禁用高危内建**（`open/exec/eval/__import__/input` 等）；显式 ALLOW |
+| `mail139`            | `action, args`    | 139邮箱：搜索/阅读/发送/草稿/附件/日程/通讯录/网盘/待办（vendored 官方 Skill 子进程调用，v1.2.0 新增） | skill 自带 confirm_token 两步确认 + 适配层 flag 黑名单（禁 `--scheduled`/`--base-url`）+ 路径锁定工作目录；显式 ALLOW |
+| `save_memory`        | `content: str`    | 把用户明确要求记住的信息同步保存到 GM 长期记忆                     | 仅在**有会话上下文且记忆功能启用**时注册；标 `is_read_only` 走权限快速通道 |
 
 **calculator 示例**：`"2 + 3 * 4"` → `14`；`"sqrt(144)"` → `12`
 
 **python_interpreter 示例**：`print(sum(range(10)))` → `标准输出：45`
 
-**save_memory 说明**：系统提示词约束——仅当用户明确表达"记住/记一下/以后记得"等意图时调用；content 须是完整、独立可理解的事实陈述；一次只保存一个主题。工具返回值按 GM 任务结果语义区分"保存成功/重复未新增/处理中/失败"，并明确指示模型**不得虚报保存成功**。详见[第十二章](#十二generalmemory-记忆接入任务2)。
+**mail139 说明**：`action` 为 enum 硬约束，共 **23 个取值**（由 `_ACTIONS` 表生成，模型无法造词）：`account / scope / auth / unbind / search / read / attachments / download / contacts / send / draft-list / draft-read / draft-send / mark / folders / move / label-add / calendar-view / calendar-search / calendar-detail / calendar-messages / calendar-add / disk-link`；`args` 为空格分隔的 `--flag value` 串（如 `--keyword 报销 --page-size 10`）。description 直接使用完整 docstring，避免显式短描述覆盖 schema 导致模型凭直觉造词。首次调用触发 139 邮箱 OAuth 授权（浏览器扫码），凭据落 `~/139mail/`（仓库外，且 `.gitignore` 兜底）。写操作（发信等）由模型层展示草稿等用户确认 + skill 层 confirm_token 双保险。
 
-> `search_memory` 检索工具按决策延后（写入侧优先）。
+**save_memory 说明**：系统提示词约束——仅当用户明确表达"记住/记一下/以后记得"等意图时调用；content 须是完整、独立可理解的事实陈述；一次只保存一个主题。工具返回值按 GM 任务结果语义区分"保存成功/重复未新增/处理中/失败"，并明确指示模型**不得虚报保存成功**。详见[第十二章](#十二generalmemory-记忆接入)。
+
+> 记忆检索**不设工具**：召回在每轮对话前自动执行并注入 system_prompt（见 12.6），相关性判定交给对话模型本身，省一轮 LLM 往返。
 
 ---
 
@@ -509,60 +560,66 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 - 超时阈值由 `.env` 的 `SESSION_TIMEOUT_MINUTES` 控制（默认 30）。
 - 前端左侧栏点击历史会话切回时会带 `resume=true`，因此**即使超过 30 分钟也能继续原会话**；只有在当前会话内自然对话且闲置超时，才会开新会话。
 - 会话状态损坏时自动降级为新会话，保证健壮性。
+- **与 GM 的会话关系（v1.2.0 简化）**：本地 `session_id` **直接**作为 GM 会话 ID 使用（写侧 `enqueue_turn` 与读侧召回均如此）。v1.1.1 时期的「本地会话→GM 会话映射 + 轮换」已随 GM `a43b3ad` 修复移除，见 [12.8](#128-记忆链路守护memory_link移除说明v120)。
 
 ---
 
-## 十二、GeneralMemory 记忆接入（任务2）
+## 十二、GeneralMemory 记忆接入
 
-> 决策范围：**仅写入侧**（`save_memory` 工具 + 回合钩子），检索/召回（`search_memory`）按用户决策延后。GM 跑 **8001** 端口，AI 助手保持 **8000**；租户 `cmic-yun`，`user_id=gm_user_lw`；回合钩子仅提交 **user + assistant 两条消息**（不含工具调用中间消息）。
+> 决策范围：**写入侧**（`save_memory` 工具 + 回合钩子）+ **读取侧**（每轮自动召回注入 system_prompt）。GM 跑 **8001** 端口，AI 助手保持 **8000**；租户 `cmic-yun`，`user_id=gm_user_lw`；回合钩子仅提交 **user + assistant 两条消息**（不含工具调用中间消息）。
 
 ### 12.1 GM 环境启动（三件套）
 
-GM 源码位于同级目录 `../GeneralMemory/`（当前 v2.4.0，只读同步上游）。**完整启动/健康检查/升级流程见 [`../GeneralMemory/README.md`](../GeneralMemory/README.md)**，此处仅列启用记忆所需的最小三件套（Postgres + API + add Worker）：
+GM 源码当前运行为 **v2.6.0**（`../gm-v2.6.0-analysis/`，生产数据卷已原地升级、不可回退；`../GeneralMemory/` v2.4.0 保留为只读参照，**不要启动它的服务**，会与 v2.6.0 抢 :8001/:5433）。最小三件套（Postgres + API + Worker）：
 
 **① PostgreSQL 容器**（数据持久化，端口 5433 避开本机默认 5432）：
 
 ```bash
 docker start memory-cmic-postgres
-# 若容器不存在，首次创建（凭证来自 GM 目录 .env 的 MEMORY_POSTGRES_*）：
-# docker run -d --name memory-cmic-postgres -p 5433:5432 \
-#   -e POSTGRES_DB=memory_cmic -e POSTGRES_USER=memory_cmic \
-#   -e POSTGRES_PASSWORD=memory_cmic_local_dev postgres:16
 ```
 
 **② GM API**（:8001，Git Bash；GM 无 python-dotenv，必须先 source .env 注入环境变量）：
 
 ```bash
-cd ../GeneralMemory
+cd ../gm-v2.6.0-analysis
 set -a && . ./.env && set +a
 ./.venv/Scripts/python.exe -m uvicorn memory_cmic.api:create_app \
   --factory --host 127.0.0.1 --port 8001
 ```
 
-**③ GM Worker**（add 角色，负责实际抽取/治理；如需画像/巩固另启 `maintenance`/`consolidation`/`profile` 角色）：
+**③ GM Worker**（v2.6.0 支持 4 个角色：`add`/`maintenance`/`consolidation`/`profile`，当前生产 4 个全开；最小启用记忆只需 `add`）：
 
 ```bash
-cd ../GeneralMemory
+cd ../gm-v2.6.0-analysis
 set -a && . ./.env && set +a
 ./.venv/Scripts/memory-cmic-worker.exe --role add
 ```
 
 验证：`curl -o /dev/null -w "%{http_code}" http://127.0.0.1:8001/docs` 返回 200。
 
+> ⚠️ 本项目后端调 GM 的所有 httpx AsyncClient 必须 `trust_env=False`——开发环境注入的代理会把绝对 URI 转发坏导致 404（读侧 `memory_retriever.py` 与写侧 `memory_client.py` 均已内置）。
+
 ### 12.2 后端配置
 
-`backend/.env` 增加记忆配置块（详见[第七章](#七配置说明env)）：
+`backend/.env` 增加记忆配置块（完整清单见[第七章](#七配置说明env)）：
 
 ```ini
-MEMORY_ENABLED=true
-GM_BASE_URL=http://127.0.0.1:8001
-GM_TOKEN=<GM 签发的 Bearer Token>
+# ---- 读写共用 ----
+MEMORY_ENABLED=true                 # 写入总开关
+GM_BASE_URL=http://127.0.0.1:8001   # GM API（读写两侧共用）
+GM_TOKEN=<GM 签发的 Bearer Token>    # 为空则记忆功能整体静默禁用
 GM_SOURCE_SYSTEM=ai_assistant
 GM_USER_ID=gm_user_lw
 GM_WAIT_TIMEOUT_MS=15000
+
+# ---- 读取侧（v1.2.0）----
+MEMORY_READ_ENABLED=true
+MEMORY_READ_BACKEND=gm_api          # gm_api（推荐）| local（直连 PG 自建检索，回退用）
+MEMORY_READ_LIMIT=5
+MEMORY_READ_TIMEOUT_MS=2500
 ```
 
-`GM_TOKEN` 为空时记忆功能整体静默禁用（`save_memory` 不注册、钩子不投递），助手其余功能不受影响。
+`GM_TOKEN` 为空时记忆功能整体静默禁用（`save_memory` 不注册、钩子不投递、召回不执行），助手其余功能不受影响。
 
 ### 12.3 两条写入路径
 
@@ -571,7 +628,9 @@ GM_WAIT_TIMEOUT_MS=15000
 | **① save_memory 工具** | 用户明确说"记住…"，模型主动调用 | 单条 user 消息（套范围声明模板，见 12.5） | `wait_for_result=true` **同步**等 GM 抽取终态（15s 超时）        | 按任务状态如实回复（见 12.4）                                |
 | **② 回合结束钩子**         | 每轮对话结束（流式/非流式都挂钩） | user + assistant 两条消息      | 先落 `memory_outbox` 表，再 **fire-and-forget** 异步投递，不阻塞响应 | 投递失败自动重试（0.5s/1s/2s 退避，最多 3 次），重启后 lifespan 自动补发 |
 
-实现位置：`app/memory_client.py`（客户端+outbox）、`app/tools/builtin_tools.py`（工具）、`app/agent.py`（钩子挂载点）。
+实现位置：`app/memory_client.py`（客户端+outbox，`enqueue_turn(session_id, user_text, assistant_text)`）、`app/tools/builtin_tools.py`（工具）、`app/agent.py`（钩子挂载点）。
+
+**任务终态观测（v1.2.0 精简为纯观测）**：投递后会轮询 GM `tasks/{task_id}` 拿终态，仅**记日志 + 回写 `memory_outbox.gm_task_status`** 供排查，`failed` 不再触发任何补救动作（原「阻断检测 + 会话轮换」已移除，见 [12.8](#128-记忆链路守护memory_link移除说明v120)）。轮询参数：`MEMORY_TASK_VERIFY_INTERVAL_S=2.0`、`_BUDGET_S=30.0`。
 
 ### 12.4 GM 契约语义（实测固化）
 
@@ -607,7 +666,57 @@ GM_WAIT_TIMEOUT_MS=15000
 
 **关联行为——DISPUTE 冲突治理**：对同一属性反复提交不同值（如工号 4444→5555→6666），GM 会将相关 `memory_item` 置为 `disputed`（同一 `conflict_group_id`），后续任务报 `dispute recovery requires explicit user clarification` 而 failed。这是 GM 的**正确治理行为**（防事实漂移），不是 bug；恢复需用户对冲突值做显式澄清。测试时切忌用同属性不同值反复打靶。
 
-### 12.6 E2E 验收记录（2026-10-09）
+### 12.6 读取侧召回（v1.2.0 起默认走 GM API）
+
+**链路**：每轮对话前 `_recall_memory_block(message)` → `memory_retriever.recall()` → 渲染为 system_prompt 片段 → `build_system_prompt(memory_block)` 动态拼装（AgentScope 的 `Agent._get_system_prompt()` 每次模型调用都会重新拼）。
+
+**双后端**（`MEMORY_READ_BACKEND` 切换）：
+
+| 后端 | 实现 | 何时用 | 差异 |
+|---|---|---|---|
+| `gm_api`（默认） | GM `POST /api/v1/memories:search`，`use_model=false`（纯向量检索，不调 Qwen 适用性判定） | 常规 | 响应只含 `{id, memory, cognitive_type}`，**无 distance/similarity**；prompt 表头用「序号」列 |
+| `local`（回退） | 直连 GM Postgres 复刻 `retrieval.py::search_task_memories`：时间有效性 + project_domains 过滤、双通道（scene/semantic）向量候选、余弦距离截断、证据链校验 | GM API 不可用或需距离信息时 | 需配 `GM_DB_URL`/`GM_EMBEDDING_*`；prompt 表头含「相关度」列 |
+
+**切换依据（等价性实测，2026-10-15）**：7 组真实业务 query、limit=5，两后端返回的 memory ID 序列**逐位 EXACT 一致（7/7）**；稳态耗时持平（0.46-0.66s）。故默认切 `gm_api` 无语义损失，且不再依赖本地 embedding 密钥与 PG 连接。
+
+**关键设计**：
+- **不设 `search_memory` 工具**——召回自动执行、结果作为数据注入 prompt，相关性判定交给对话模型本身（模型本来就要推理，零额外延迟；设工具则每次召回多一轮 LLM 往返）。
+- **绝不抛异常给对话链路**：超时（`MEMORY_READ_TIMEOUT_MS=2500`）、GM 非 2xx、任何异常都降级为「本轮无记忆」，只记 debug 日志。
+- **短输入跳过**：用户输入 < `MEMORY_READ_MIN_QUERY_CHARS=2` 不检索。
+
+### 12.7 agent_id / source_system 过滤语义（实测固化）
+
+`SearchRequest` 可选过滤参数 `agent_id`、`source_system`（可组合，AND 关系）。实测 7 组组合（`backend/scripts/c_step_agent_id_test.py` 可重跑）：
+
+| 过滤组合 | 行为 |
+|---|---|
+| 不传任何过滤 | **跨 Agent 共享视角**：同一 tenant+user 下所有 Agent 写入的记忆都可见 |
+| `agent_id=X` | 只返回由 X 的任务抽取的记忆（精确隔离）；X 不存在则**返回空列表，不报错** |
+| `source_system=X` | 直接过滤 `SourceRecord.source_system`（与凭证的 `allowed_source_systems` 鉴权是两个独立维度） |
+
+**本项目结论：读写两侧都不传 `agent_id`。**
+- 写侧：`AddRequest.agent_id` 可选，不传时 GM 回落到**凭证的 `caller_agent_id`**（ai-assistant 的 token 对应 `ai_assistant`）——入库归属正确。
+- 读侧：个人助手定位下共享视角是**期望行为**（用户不管记忆是哪个 Agent 写的，都该被想起）。
+- 注意：任一过滤参数存在时 GM 强制 `validate_user_evidence=True`，无匹配 source 直接返回空（`retrieval.py` `_matching_source_ids` + 282-283 行）。
+
+**GM 记忆"软删除"标准姿势**（清理测试数据用）：GM 无撤销 add 的官方 API，须改两处生命周期状态——`memory_item.status='invalidated'`（检索只取 active）+ `memory_embedding.status='stale'`（该表 CHECK 只允许 active/stale；stale 恰好移出 `WHERE status='active'` 的 HNSW 部分索引）。两步都做才算移出召回链路。psql 用户是 `memory_cmic`（不是 postgres）。
+
+### 12.8 记忆链路守护（memory_link）移除说明（v1.2.0）
+
+**背景**：v1.1.1 曾引入 313 行的 `memory_link.py`，用于兼容 GM v2.4.0 的缺陷——同一会话内**前序 add 任务 failed 会导致后续任务被 `PRIOR_TASK_FAILED` 连坐拒绝**（会话级阻塞）。当时的对策是检测阻断 + 轮换 GM 会话 ID 就地重试。
+
+**移除依据**：GM v2.6.0 提交 `a43b3ad` 已修复该缺陷（worker 不再传播 `PRIOR_TASK_FAILED`，失败任务不阻断同会话后续任务；佐证见 GM `reports/add_context_validation.md`）。守护失去存在意义。
+
+**v1.2.0 移除清单**：
+- 删除 `app/memory_link.py`（阻断检测 + 会话轮换 + 受害判定）；
+- `agent.py`：不再做 `resolve_gm_session` 解析，**本地 session_id 直接作为 GM 会话 ID**；
+- `main.py`：删除 `/api/memory/link/blocked` 与 `/api/memory/link/{session_id}` 观测端点；
+- `builtin_tools.py`：`save_memory` 删除 `is_victim → rotate_session` 就地重试分支，内联为单次调用；
+- `database.py`：删除 `memory_link` 建表 DDL 与 `link_*`/`_outbox_quarantine` 等函数（**存量库中的表与数据保留不动**，新库不再建）；`memory_outbox` 的 `quarantined`/`gm_session_id`/`rotate_count` 列标记为历史遗留；
+- `config.py`：删除死配置 `MEMORY_LINK_GUARD_ENABLED`/`MEMORY_LINK_MAX_GENERATION`/`MEMORY_LINK_MAX_ROTATE_PER_ITEM`；
+- 保留：`_verify_tasks` 纯观测轮询（见 12.3）。
+
+### 12.9 E2E 验收记录（2026-10-09）
 
 | 用例                                        | 结果                                                                                       |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -616,16 +725,16 @@ GM_WAIT_TIMEOUT_MS=15000
 | 回合钩子                                      | ✅ `memory_outbox` 5 条全部 `sent`                                                           |
 | 测试数据清理                                    | ✅ probe 会话、diagnostics 残留、governance_pending 全清，GM 库恢复基线（保留原始 4 条记忆）                     |
 
-### 12.7 观测与排查入口
+### 12.10 观测与排查入口
 
-- 后端日志：启动出现"记忆服务已启用"；每次投递打印 `记忆投递成功 outbox=… task=…`。
+- 后端日志：启动出现"记忆服务已启用"；每次投递打印 `记忆投递成功 outbox=… task=…`；召回失败打印 debug 级降级原因。
 - GM 侧任务状态：`GET {GM_BASE_URL}/api/v1/tasks/{task_id}`（带 Bearer Token）。
 - GM 库直查（诊断跳过原因）：
   ```bash
   docker exec -i memory-cmic-postgres psql -U memory_cmic -d memory_cmic \
     -c "SELECT status, payload->'execution'->'diagnostics' FROM memory_task ORDER BY created_at DESC LIMIT 5;"
   ```
-  > `docker exec` 执行 stdin SQL **必须带 `-i`**，否则 SQL 静默不执行且 exit 0。
+  > `docker exec` 执行 stdin SQL **必须带 `-i`**，否则 SQL 静默不执行且 exit 0。psql 用户是 `memory_cmic`（不是 postgres）。
 
 ---
 
@@ -683,6 +792,30 @@ pip install -r requirements.txt -i https://pypi.org/simple
 
 两种可能：① **重复事实**——results 为空，属正常去重；② **治理跳过**——查 `memory_task.payload->'execution'->'diagnostics'`，若见 `SCOPE_UNRESOLVED` 说明事实被判范围不明（见 [12.5](#125-踩坑记录scope_unresolved-跳过根因与修复)）。另注意：同属性反复提交不同值会触发 DISPUTE，相关条目变 `disputed` 后后续任务会 failed，需用户显式澄清才能恢复。
 
+### 8. 调本机 GM 返回 404（同一个 URL，sync 客户端 200 / async 客户端 404）
+
+**原因**：开发环境注入了 `http_proxy`/`HTTPS_PROXY` 等代理变量。`httpx.AsyncClient` 默认 `trust_env=True` 会走代理，代理把**整段绝对 URI 当路径**转发，GM 收到 `POST http%3A//127.0.0.1%3A8001/api/...` → Starlette 默认 404（不是应用的 401/422，极易误判为"路由不存在"）。
+
+**解决**：本地调用一律 `httpx.AsyncClient(trust_env=False)`（读写两侧模块均已内置）；调外网（DashScope/SiliconFlow）保持默认走代理。排障第一动作：看服务端访问日志的 request path，若是"整段绝对 URI 被百分号转义"，100% 是代理转发。`curl` 同样受影响，必要时 `curl --noproxy '*'`。
+
+### 9. 前端流式输出"光标闪但文字不增长，done 后才整段出现"
+
+**原因**：**Vue 3 响应式陷阱**——`messages.value.push(obj)` 之后再改 `obj` **不会触发重渲染**（push 进去的是原始对象，回调改的也是原始对象，绕过了数组里的 reactive proxy）。
+
+**解决**（本项目已修复，新增流式消息时照此办理）：
+1. `messages.value.push({...})` 后立刻 `const aiMsg = messages.value[messages.value.length - 1]` 取回 **proxy**，后续回调只改 `aiMsg`；
+2. delta 合帧：`requestAnimationFrame` + `pendingText` 合并同帧多个 delta，done/error/abort 时 `flushDelta()` 幂等落盘；
+3. 渲染节流：MessageBubble 内 markdown 每 90ms 最多重渲一次；流式期间跳过 highlight.js，结束后一次性高亮；
+4. 滚动：禁用 `watch(messages, {deep:true})`，改 watch「条数+末条长度」computed；流式期间加 `.chat-window--instant` 关平滑滚动。
+
+排障：怀疑"后端不流式"时先 `curl -sN` 直连 :8000 数 delta 帧时间戳——帧分散到达则后端无罪，直接查前端响应式。验证响应式可用项目自带 `@vue/reactivity` 的 `effect()` 数渲染次数。
+
+### 10. 新工具调用"无声卡死"（SSE 只发 tool_start 不发 tool_result）
+
+**原因**：AgentScope 2.0.9 默认 `PermissionMode.DEFAULT` 下，未显式声明权限的工具会被判 ASK → 工具 park + yield RequireUserConfirmEvent，而前端无确认 UI → 永久卡死（done 且 finished_reason 为空）。
+
+**解决**：新增工具必须二选一——①只读类标 `is_read_only=True`；②有副作用但可信的传 `permission=PermissionDecision(behavior=PermissionBehavior.ALLOW, message=...)`（**语义优先选②**，不要为绕权限谎报 read-only）。排障：backend.log 里 dashscope 调用只有一次（无工具结果回填后的第二次 LLM 调用）即基本可判定权限 ASK。当前 5 个工具的权限声明见[第十章](#十内置工具)。
+
 ---
 
 ## 十四、后续规划
@@ -690,10 +823,10 @@ pip install -r requirements.txt -i https://pypi.org/simple
 | 任务      | 内容                                                            | 状态                         |
 | ------- | ------------------------------------------------------------- | -------------------------- |
 | **任务1** | AI 助手 Demo（本项目）                                               | ✅ 已完成                      |
-| **任务2** | GeneralMemory **写入侧**接入：`save_memory` 工具 + 回合钩子 + outbox 可靠投递 | ✅ 已完成（2026-10-09 E2E 验收通过） |
-| 任务2 延后项 | 检索/召回侧（`search_memory` 工具、意图化检索）                              | ⏳ 按决策延后                    |
-| **任务3** | 记忆管理平台（百炼 UI 复刻）                                              | ⏳ 待开始                      |
-| **任务4** | 记忆服务插件化                                                       | ⏳ 待开始                      |
+| **任务2** | GeneralMemory 接入：写入侧（`save_memory` + 回合钩子 + outbox）           | ✅ 已完成（2026-10-09 E2E 验收通过） |
+| 任务2 读取侧 | 每轮召回注入 system_prompt；v1.2.0 起默认走 GM 官方 API（`use_model=false`） | ✅ 已完成（2026-10-15，7/7 等价性实测 + 真实召回验证） |
+| **任务3** | 记忆管理平台（运营监控）                                                   | ✅ 主体已在 `../memory-platform/` 落地（v1.1.2） |
+| **任务4** | 记忆服务插件化 → `gm-memory` MCP server                              | ⏳ GM 官方暂缓 MCP，当前以 HTTP API 直调替代；待启动 |
 
 ---
 
@@ -709,4 +842,4 @@ pip install -r requirements.txt -i https://pypi.org/simple
 
 ---
 
-*最后更新：2026-10-10（第六章补充实际后台启动命令与端口拓扑；12.1 GM 路径更新为 `../GeneralMemory/`，对齐 v2.4.0）*
+*最后更新：2026-10-15（v1.2.0：读侧切 GM API 双后端、移除 memory_link 会话守护、集成 139邮箱 Skill、GM 环境对齐 v2.6.0；新增 12.6 读取侧召回 / 12.7 agent_id 过滤语义 / 12.8 守护移除说明）*

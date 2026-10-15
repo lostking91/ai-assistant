@@ -1,26 +1,30 @@
-"""GeneralMemory 读取侧客户端：本地向量检索（不含 LLM 适用性判定）。
+"""GeneralMemory 读取侧客户端：双后端（gm_api / local）。
 
-为什么不用 GM 的 POST /api/v1/memories:search？
-    该接口在 api.py:138-160 硬编码了 QwenFactModel + validate_user_evidence=True，
-    请求内同步串了「SiliconFlow embedding → Qwen 适用性判定」两次远程 LLM 调用，
-    实测 6.5-9.1s，且无任何参数可关闭判定层。GM 源码按项目约定冻结，不能改。
+后端一：gm_api（默认，2026-10-15 起）
+    调 GM POST /api/v1/memories:search，use_model=false（v2.6.0 提交 031ea68 新增，
+    关闭 Qwen 适用性判定，纯向量检索，稳态 0.46-0.56s）。
+    等价性实测（2026-10-15，7 组真实业务 query，limit=5）：与 local 后端返回的
+    memory ID 序列逐位完全一致（7/7 EXACT），故切换无语义损失。
+    差异点：SearchResponse 只含 id/memory/cognitive_type，无 distance ——
+    max_distance 截断与相关度展示在此后端不可用，相关性判断完全交给对话模型。
+    必须 trust_env=False：环境代理会把绝对 URI 转发坏导致 404（见 config 注释）。
 
-所以本模块参照 GM retrieval.py::search_task_memories 的向量检索语义，在 ai-assistant
-侧直连 GM 的 PostgreSQL（只读）自行实现，**去掉 LLM 判定层**：
+后端二：local（回退保留）
+    直连 GM PostgreSQL（只读）自建向量检索，复刻 GM retrieval.py::search_task_memories
+    语义（历史动机：v2.4.0 search 硬编码 LLM 判定 6.5-9.1s 无法关闭）：
     - _scope_filters(semantic=True)      -> 时间有效性 + project_domains 过滤
     - validate_user_evidence=True        -> subject_type='user' + cognitive_type in (fact,inference)
     - _vector_statement                  -> cosine_distance + model_id + content_hash 一致性
     - 双通道(scene/semantic)各取 candidate_limit//2 后按 distance 合并
     - memory_has_valid_evidence          -> 证据链完整性校验（supports/derives 递归）
-实测总耗时 0.20-0.35s（其中 embedding 0.13-0.25s），比 GM API 快约 20 倍。
 
-「相关性判定」交给对话模型本身：检索结果作为数据注入 system_prompt，由 AI 助手
-自行判断是否采用 —— 这一步在模型本来就要做的推理里完成，零额外延迟。
+「相关性判定」两个后端都交给对话模型本身：检索结果作为数据注入 system_prompt，
+由 AI 助手自行判断是否采用 —— 这一步在模型本来就要做的推理里完成，零额外延迟。
 
 约定：本模块**绝不抛异常给对话链路**，任何失败都降级为「本轮无记忆」。
 
-事件循环注意：Windows 上 uvicorn 默认使用 ProactorEventLoop，psycopg 的
-AsyncConnection 明确不支持该循环（会直接报错）。因此 DB 部分采用**同步
+事件循环注意（仅 local 后端）：Windows 上 uvicorn 默认使用 ProactorEventLoop，
+psycopg 的 AsyncConnection 明确不支持该循环（会直接报错）。因此 DB 部分采用**同步
 Connection + asyncio.to_thread** 跑在线程池里：不改启动方式、不依赖循环实现，
 且本地 PG 查询本来就是短阻塞操作，线程池执行最稳。
 """
@@ -126,12 +130,14 @@ class RetrievedMemory:
     confidence: float | None
     business_domains: list[str] | None
     project_context: str | None
-    distance: float
+    distance: float | None  # None = gm_api 后端（SearchResponse 不返回距离）
     channels: dict[str, int] = field(default_factory=dict)
 
     @property
-    def similarity(self) -> float:
-        """余弦距离 -> 相似度，裁剪到 [0,1] 便于展示。"""
+    def similarity(self) -> float | None:
+        """余弦距离 -> 相似度，裁剪到 [0,1]；gm_api 后端无距离时返回 None。"""
+        if self.distance is None:
+            return None
         return max(0.0, min(1.0, 1.0 - self.distance))
 
 
@@ -151,12 +157,20 @@ class RecallResult:
 
 
 def retrieval_enabled() -> bool:
-    """读侧检索是否可用（配置齐全才启用）。"""
-    return bool(
-        settings.memory_read_enabled
-        and settings.gm_db_url.strip()
-        and settings.gm_embedding_api_key.strip()
-    )
+    """读侧检索是否可用（配置齐全才启用，按 backend 分别判断）。"""
+    if not settings.memory_read_enabled:
+        return False
+    if _backend() == "gm_api":
+        # gm_api 后端：走 GM HTTP search，需要 base_url + token（与写侧共用凭证）
+        return bool(settings.gm_base_url.strip() and settings.gm_token.strip())
+    # local 后端：直连 Postgres 自建检索，需要 db_url + embedding key
+    return bool(settings.gm_db_url.strip() and settings.gm_embedding_api_key.strip())
+
+
+def _backend() -> str:
+    """当前读侧后端：gm_api（默认）| local。非法值回落 gm_api。"""
+    b = (settings.memory_read_backend or "gm_api").strip().lower()
+    return b if b in ("gm_api", "local") else "gm_api"
 
 
 def _conninfo() -> str:
@@ -427,6 +441,74 @@ async def _recall_impl(
     )
 
 
+async def _recall_gm_api(
+    query: str,
+    *,
+    user_id: str,
+    limit: int,
+) -> RecallResult:
+    """gm_api 后端：调 GM POST /api/v1/memories:search（use_model=false 纯向量检索）。
+
+    关键约定：
+      - trust_env=False 必须：沙箱/部分环境注入 http_proxy，httpx 默认走代理会把
+        整段绝对 URI 当路径转发 -> 服务端 404（同 URL 同步却 200，极具误导性）。
+      - use_model=false：不触发 Qwen 适用性判定，与 local 后端语义等价（已 7/7 实测）。
+      - SearchResponse 只含 id/memory/cognitive_type，无 distance/similarity，故
+        memory_read_max_distance 截断在此后端不生效；相关度过滤交给对话模型（prompt 已注入规则）。
+    """
+    timings: dict[str, float] = {}
+    url = f"{settings.gm_base_url.rstrip('/')}/api/v1/memories:search"
+    headers = {
+        "Authorization": f"Bearer {settings.gm_token.strip()}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "user_id": user_id,
+        "query": query,
+        "limit": limit,
+        "use_model": False,
+    }
+
+    t0 = time.perf_counter()
+    # trust_env=False：绕过环境代理（见上）
+    async with httpx.AsyncClient(
+        timeout=settings.memory_read_timeout_ms / 1000.0, trust_env=False
+    ) as client:
+        resp = await client.post(url, json=body, headers=headers)
+    timings["search"] = time.perf_counter() - t0
+
+    resp.raise_for_status()
+    data = resp.json()
+    raw = data.get("results") or []
+
+    memories: list[RetrievedMemory] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        content = str(row.get("memory") or "").strip()
+        if not content:
+            continue
+        memories.append(
+            RetrievedMemory(
+                id=str(row.get("id") or ""),
+                content=content,
+                summary="",  # SearchResponse 不返回 summary
+                cognitive_type=str(row.get("cognitive_type") or "fact"),
+                confidence=None,
+                business_domains=None,
+                project_context=None,
+                distance=None,  # API 无距离
+                channels={},
+            )
+        )
+
+    return RecallResult(
+        memories=memories[:limit],
+        scene_names=[],
+        timings={k: round(v, 4) for k, v in timings.items()},
+    )
+
+
 async def recall(
     query: str,
     *,
@@ -449,23 +531,36 @@ async def recall(
     uid = (user_id or settings.gm_user_id).strip()
     lim = limit or settings.memory_read_limit
     budget = settings.memory_read_timeout_ms / 1000.0
+    backend = _backend()
 
     t_start = time.perf_counter()
     try:
-        result = await asyncio.wait_for(
-            _recall_impl(
+        if backend == "gm_api":
+            coro = _recall_gm_api(text_query, user_id=uid, limit=lim)
+        else:
+            coro = _recall_impl(
                 text_query,
                 user_id=uid,
                 limit=lim,
                 validate_evidence=settings.memory_read_validate_evidence,
                 max_distance=settings.memory_read_max_distance,
-            ),
-            timeout=budget,
-        )
+            )
+        result = await asyncio.wait_for(coro, timeout=budget)
     except asyncio.TimeoutError:
         elapsed = int((time.perf_counter() - t_start) * 1000)
-        logger.warning("记忆检索超时（预算 %.0fms），本轮降级为无记忆", budget * 1000)
+        logger.warning("记忆检索超时（backend=%s 预算 %.0fms），本轮降级为无记忆", backend, budget * 1000)
         return RecallResult(memories=[], degraded=True, reason="timeout", elapsed_ms=elapsed)
+    except httpx.HTTPStatusError as exc:
+        # gm_api 后端：GM 返回非 2xx（401/403/422/502/503 等）
+        elapsed = int((time.perf_counter() - t_start) * 1000)
+        logger.warning(
+            "记忆检索 GM API 返回 %s，本轮降级为无记忆：%s",
+            exc.response.status_code, exc.response.text[:200],
+        )
+        return RecallResult(
+            memories=[], degraded=True,
+            reason=f"gm_api_http_{exc.response.status_code}", elapsed_ms=elapsed,
+        )
     except psycopg.Error as exc:
         elapsed = int((time.perf_counter() - t_start) * 1000)
         logger.warning("记忆检索数据库异常，本轮降级为无记忆：%s", exc)
@@ -474,9 +569,9 @@ async def recall(
         )
     except httpx.HTTPError as exc:
         elapsed = int((time.perf_counter() - t_start) * 1000)
-        logger.warning("记忆检索 embedding 调用失败，本轮降级为无记忆：%s", exc)
+        logger.warning("记忆检索远程调用失败（backend=%s），本轮降级为无记忆：%s", backend, exc)
         return RecallResult(
-            memories=[], degraded=True, reason=f"embed_error:{type(exc).__name__}", elapsed_ms=elapsed
+            memories=[], degraded=True, reason=f"net_error:{type(exc).__name__}", elapsed_ms=elapsed
         )
     except Exception as exc:  # noqa: BLE001 - 兜底，绝不让检索拖垮对话
         elapsed = int((time.perf_counter() - t_start) * 1000)
@@ -511,6 +606,10 @@ def format_memories_for_prompt(result: RecallResult) -> str:
     if not result.memories:
         return ""
 
+    # gm_api 后端无 distance/similarity，用"序号"代替"相关度"列；local 后端保留相关度
+    has_sim = any(m.similarity is not None for m in result.memories)
+    head_col = "相关度" if has_sim else "序号"
+
     lines = [
         "# 检索到的长期记忆（仅供参考）",
         "",
@@ -518,15 +617,16 @@ def format_memories_for_prompt(result: RecallResult) -> str:
         "也不是本轮对话内容**。请你自行判断哪些与当前问题真正相关，只采用相关的部分；"
         "无关的条目直接忽略，不要提及、不要罗列、也不要因为存在这些条目而改变回答方式。",
         "",
-        "| 相关度 | 类型 | 记忆内容 |",
+        f"| {head_col} | 类型 | 记忆内容 |",
         "| --- | --- | --- |",
     ]
-    for mem in result.memories:
+    for idx, mem in enumerate(result.memories, start=1):
         kind = "事实" if mem.cognitive_type == "fact" else "推断（低置信度）"
         content = mem.content.replace("|", "\\|").replace("\n", " ").strip()
         if len(content) > 200:
             content = content[:200] + "…"
-        lines.append(f"| {mem.similarity:.0%} | {kind} | {content} |")
+        lead = f"{mem.similarity:.0%}" if mem.similarity is not None else str(idx)
+        lines.append(f"| {lead} | {kind} | {content} |")
 
     lines.extend(
         [

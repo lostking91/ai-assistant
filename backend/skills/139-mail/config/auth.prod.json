@@ -1,0 +1,50 @@
+{
+  "bridge": {
+    "uploadPath": "/authApi/mclawUpload",
+    "account": "",
+    "timeoutSeconds": 30,
+    "url": "https://smsrebuild1.mail.10086.cn/authApi/mclaw",
+    "verifyTls": true,
+    "downloadBaseUrl": "https://appmail.mail.10086.cn/RmWeb/view.do"
+  },
+  "tokenService": {
+    "url": "https://idaas.cmpassport.com",
+    "devId": "1403",
+    "clientId": "a50104026369470987b736811bada2a8",
+    "skillId": "139mail-skill",
+    "skillName": "139邮箱Skill",
+    "clawUid": "",
+    "strategyId": "c98c48f4876f4a69903944dc11b3a12f",
+    "templateId": "p733ppu20cz0l5jv5ge6pxfm1m8jcdn3",
+    "scopeIds": [
+      "10010",
+      "10011",
+      "10012",
+      "10013",
+      "10014"
+    ],
+    "scopeKeys": {
+      "accountRead": "10010",
+      "mailManage": "10011",
+      "mailSend": "10012",
+      "calendarManage": "10013",
+      "contactsRead": "10014"
+    },
+    "scopePermissionMap": {
+      "10010": "邮箱账号读取：读取139邮箱账号，用于登录",
+      "10011": "邮件管理：读取139邮箱邮件内容，用于搜索、阅读、总结、标记、移动邮件等功能",
+      "10012": "邮件发送：发送139邮箱邮件，包括新建邮件、回复及转发",
+      "10013": "邮箱日程管理：在139邮箱日历中查看、创建、修改以及删除日程",
+      "10014": "邮箱通讯录读取：读取139邮箱通讯录联系人信息"
+    },
+    "storageBackend": "file",
+    "authInfoPath": "",
+    "timeoutSeconds": 10
+  },
+  "unbindSkill": {
+    "url": "https://mail.10086.cn/s"
+  },
+  "mail": {
+    "signatureName": "139邮箱助手"
+  }
+}

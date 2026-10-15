@@ -45,37 +45,26 @@ CREATE TABLE IF NOT EXISTS memory_outbox (
     session_id      TEXT NOT NULL,
     idempotency_key TEXT NOT NULL UNIQUE,
     payload_json    TEXT NOT NULL,
-    -- pending/sending/sent/failed/quarantined
-    -- quarantined：GM 侧真实抽取失败（毒消息），隔离不再重投，避免阻断后续
+    -- pending/sending/sent/failed
+    -- （历史遗留：旧版本还有 quarantined 状态，可能存在于存量行中）
     status          TEXT NOT NULL DEFAULT 'pending',
     attempts        INTEGER NOT NULL DEFAULT 0,
     task_id         TEXT,
     last_error      TEXT,
-    -- 本条实际投递到的 GM 会话 ID（轮换后会与 session_id 不同）
+    -- 本条实际投递到的 GM 会话 ID（历史遗留：轮换机制时期可能与 session_id 不同）
     gm_session_id   TEXT,
     -- GM 侧任务终态：null/pending/processing/succeeded/partial/failed/cancelled
     gm_task_status  TEXT,
-    -- 因 PRIOR_TASK_FAILED 被轮换重投的次数
+    -- 历史遗留列：因 PRIOR_TASK_FAILED 被轮换重投的次数（轮换机制已随 GM v2.6.0 移除）
     rotate_count    INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status ON memory_outbox(status, id);
 
--- 本地会话 -> GM 记忆会话的映射（记忆链路守护）。
--- GM 的会话级顺序保护（worker.py:987-1009）会在某会话出现 failed/partial/cancelled
--- 任务后，把该会话 batch_seq 更大的所有后续任务判为 PRIOR_TASK_FAILED，且 partial
--- 不会自动清理 => 一旦卡住，该会话后续记忆永久停摆。
--- 对策：检测到阻断时，为本地会话轮换出一个新的 GM 会话 ID（generation+1），
--- 新会话 batch_seq 从 0 起算，绕开旧会话的失败前驱；读侧只按 tenant 过滤，召回不受影响。
-CREATE TABLE IF NOT EXISTS memory_link (
-    session_id      TEXT PRIMARY KEY,           -- 本地 ai-assistant 会话
-    gm_session_id   TEXT NOT NULL,              -- 当前使用的 GM 会话 ID
-    generation      INTEGER NOT NULL DEFAULT 0, -- 轮换代次（0=未轮换，沿用本地 session_id）
-    blocked         INTEGER NOT NULL DEFAULT 0, -- 1=当前 GM 会话已知被阻断，待轮换
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
-);
+-- 历史说明：此处曾有 memory_link 表（本地会话 -> GM 会话映射，支撑顺序阻断
+-- 轮换守护）。GM v2.6.0(a43b3ad) 起失败终态不再传播给后续任务，会话级顺序
+-- 阻断不复存在，守护逻辑已移除，新库不再建此表；存量库中的表与数据保留不动。
 """
 
 
@@ -264,28 +253,6 @@ def _outbox_list_by_ids(task_ids: list[str]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def _outbox_list_affected(gm_session_id: str, limit: int = 200) -> list[dict[str, Any]]:
-    """取某 GM 会话里"未成功形成记忆"的发件（轮换时要重投的受害者）。
-
-    判定：status=failed（含被 PRIOR_TASK_FAILED 判死的），或 status=sent 但
-    gm_task_status ∈ failed/partial/cancelled（GM 侧其实没成功）。
-    已 succeeded 的不动（记忆已形成）；quarantined 的毒消息也不动（已隔离）。
-    """
-    with closing(_connect()) as conn:
-        rows = conn.execute(
-            """SELECT * FROM memory_outbox
-               WHERE gm_session_id = ?
-                 AND (
-                       status = 'failed'
-                    OR (status = 'sent'
-                        AND gm_task_status IN ('failed', 'partial', 'cancelled'))
-                 )
-               ORDER BY id ASC LIMIT ?""",
-            (gm_session_id, limit),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
 def _outbox_list_pending_gm(limit: int = 200) -> list[dict[str, Any]]:
     """取已投递但 GM 终态未知的发件（task_id 非空且 gm_task_status 为 pending/processing/null）。"""
     with closing(_connect()) as conn:
@@ -295,103 +262,6 @@ def _outbox_list_pending_gm(limit: int = 200) -> list[dict[str, Any]]:
                  AND (gm_task_status IS NULL
                       OR gm_task_status IN ('pending', 'processing'))
                ORDER BY id ASC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def _outbox_quarantine(outbox_id: int, reason: str) -> None:
-    """把毒消息隔离（不再重投），记录 GM 终态与原因。"""
-    with closing(_connect()) as conn:
-        conn.execute(
-            """UPDATE memory_outbox
-               SET status = 'quarantined', updated_at = ?,
-                   last_error = ?, gm_task_status = COALESCE(gm_task_status, 'failed')
-               WHERE id = ?""",
-            (reason, _now_iso(), outbox_id),
-        )
-        conn.commit()
-
-
-def _outbox_requeue_rotated(
-    outbox_id: int,
-    new_gm_session_id: str,
-    new_payload_json: str,
-    new_idempotency_key: str,
-) -> None:
-    """轮换重投：改写 GM 会话 ID + 新幂等键 + 新载荷，状态重置为 pending。
-
-    新幂等键是必须的——GM 侧幂等以 (caller_agent, idempotency_key) 为键，
-    沿用旧键会被 replay 到原 task（仍在被阻断的旧 GM 会话里），达不到绕开目的。
-    """
-    with closing(_connect()) as conn:
-        conn.execute(
-            """UPDATE memory_outbox
-               SET gm_session_id = ?, payload_json = ?, idempotency_key = ?,
-                   status = 'pending', task_id = NULL, gm_task_status = NULL,
-                   last_error = NULL, rotate_count = rotate_count + 1, updated_at = ?
-               WHERE id = ?""",
-            (new_gm_session_id, new_payload_json, new_idempotency_key, _now_iso(), outbox_id),
-        )
-        conn.commit()
-
-
-# ------------------------------------------------------------------ memory_link（同步）
-
-
-def _link_get(session_id: str) -> dict[str, Any] | None:
-    with closing(_connect()) as conn:
-        row = conn.execute(
-            "SELECT * FROM memory_link WHERE session_id = ?", (session_id,)
-        ).fetchone()
-    return dict(row) if row else None
-
-
-def _link_ensure(session_id: str, gm_session_id: str) -> None:
-    """确保本地会话有一条链路映射（首次投递时建立，generation=0）。"""
-    now = _now_iso()
-    with closing(_connect()) as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO memory_link
-               (session_id, gm_session_id, generation, blocked, created_at, updated_at)
-               VALUES (?, ?, 0, 0, ?, ?)""",
-            (session_id, gm_session_id, now, now),
-        )
-        conn.commit()
-
-
-def _link_rotate(session_id: str, new_gm_session_id: str) -> None:
-    """轮换到新一代 GM 会话，清除阻断标记。"""
-    with closing(_connect()) as conn:
-        conn.execute(
-            """UPDATE memory_link
-               SET gm_session_id = ?, generation = generation + 1, blocked = 0, updated_at = ?
-               WHERE session_id = ?""",
-            (new_gm_session_id, _now_iso(), session_id),
-        )
-        conn.commit()
-
-
-def _link_mark_blocked(session_id: str, gm_session_id: str) -> None:
-    """标记会话的 GM 链路被阻断（upsert：兼容无映射行的存量会话）。"""
-    now = _now_iso()
-    with closing(_connect()) as conn:
-        conn.execute(
-            """INSERT INTO memory_link
-               (session_id, gm_session_id, generation, blocked, created_at, updated_at)
-               VALUES (?, ?, 0, 1, ?, ?)
-               ON CONFLICT(session_id) DO UPDATE SET blocked = 1, updated_at = ?""",
-            (session_id, gm_session_id, now, now, now),
-        )
-        conn.commit()
-
-
-def _link_list_blocked(limit: int = 100) -> list[dict[str, Any]]:
-    """列出所有已知被阻断、待轮换的本地会话（供后台巡检）。"""
-    with closing(_connect()) as conn:
-        rows = conn.execute(
-            """SELECT * FROM memory_link WHERE blocked = 1
-               ORDER BY updated_at ASC LIMIT ?""",
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -461,48 +331,8 @@ async def outbox_list_by_ids(task_ids: list[str]) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_outbox_list_by_ids, task_ids)
 
 
-async def outbox_list_affected(gm_session_id: str, limit: int = 200) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_outbox_list_affected, gm_session_id, limit)
-
-
 async def outbox_list_pending_gm(limit: int = 200) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_outbox_list_pending_gm, limit)
-
-
-async def outbox_quarantine(outbox_id: int, reason: str) -> None:
-    await asyncio.to_thread(_outbox_quarantine, outbox_id, reason)
-
-
-async def outbox_requeue_rotated(
-    outbox_id: int, new_gm_session_id: str, new_payload_json: str, new_idempotency_key: str
-) -> None:
-    await asyncio.to_thread(
-        _outbox_requeue_rotated,
-        outbox_id,
-        new_gm_session_id,
-        new_payload_json,
-        new_idempotency_key,
-    )
-
-
-async def link_get(session_id: str) -> dict[str, Any] | None:
-    return await asyncio.to_thread(_link_get, session_id)
-
-
-async def link_ensure(session_id: str, gm_session_id: str) -> None:
-    await asyncio.to_thread(_link_ensure, session_id, gm_session_id)
-
-
-async def link_rotate(session_id: str, new_gm_session_id: str) -> None:
-    await asyncio.to_thread(_link_rotate, session_id, new_gm_session_id)
-
-
-async def link_mark_blocked(session_id: str, gm_session_id: str) -> None:
-    await asyncio.to_thread(_link_mark_blocked, session_id, gm_session_id)
-
-
-async def link_list_blocked(limit: int = 100) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_link_list_blocked, limit)
 
 
 # ------------------------------------------------------------------ 业务辅助
