@@ -52,7 +52,12 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("记忆服务已启用：%s", settings.gm_base_url)
     else:
         logger.info("记忆服务未启用（MEMORY_ENABLED=false 或 GM 配置缺失）")
+    # gm-memory MCP（stdio 子进程，共享连接；失败仅降级不阻断启动）
+    from .mcp_manager import shutdown_mcp, startup_mcp
+
+    await startup_mcp()
     yield
+    await shutdown_mcp()
 
 
 app = FastAPI(
@@ -86,6 +91,33 @@ async def health() -> HealthResponse:
         api_key_configured=settings.has_api_key,
         tools=tools,
     )
+
+
+# ------------------------------------------------------------------ 权限审计
+
+
+@app.get("/api/permissions")
+async def permissions_audit(session_id: str | None = None) -> dict:
+    """输出当前会注册的全部工具的权限矩阵（生产同款引擎，DEFAULT 模式）。
+
+    用途：随时验证"默认权限"——所有工具都应是 allow；出现 ask/deny 说明
+    有工具没显式声明权限（注册时已被 permission_gate 拦截，这里用于审计复核）。
+    传 session_id 可连带审计 save_memory（该工具仅在会话上下文注册）。
+    只评估不执行，无副作用。
+    """
+    from .tools import build_toolkit
+    from .tools.permission_gate import audit_tools
+
+    toolkit = await build_toolkit(session_id=session_id)
+    # Toolkit 把工具存放在 tool_groups[].tools（AgentScope 2.0.9）
+    tools = [t for g in toolkit.tool_groups for t in g.tools]
+    rows = await audit_tools(tools)
+    return {
+        "mode": "default",
+        "total": len(rows),
+        "all_allow": all(r["behavior"] == "allow" for r in rows),
+        "tools": rows,
+    }
 
 
 # ------------------------------------------------------------------ 非流式对话

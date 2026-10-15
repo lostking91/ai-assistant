@@ -297,29 +297,39 @@ def _make_save_memory(session_id: str):
 async def build_toolkit(session_id: str | None = None) -> Toolkit:
     """构建并返回已注册全部工具的 Toolkit。
 
+    所有工具（含 MCP）一律经 permission_gate.add_tool_gated 注册：用生产同款
+    权限引擎（PermissionEngine + AgentState 默认 context，即 DEFAULT 模式）在
+    注册前预跑判定，ASK/DENY 的工具拒绝注册并在启动期抛错——从根上杜绝
+    "注册了却无声卡死"（v1.1.1 教训的机制化解法，详见 permission_gate.py）。
+
     Args:
         session_id: 当前本地会话 ID（同时作为 GM 会话 ID）。提供且记忆功能
             启用时，注册 save_memory 工具（GM 契约要求 session 绑定，工具
             需要会话上下文）。
     """
+    from .permission_gate import add_tool_gated
+
     toolkit = Toolkit()
-    await toolkit.add_tool(
+    await add_tool_gated(
+        toolkit,
         FunctionTool(
             func=get_current_time,
             name="get_current_time",
             description="获取当前的日期和时间（东八区）",
             is_read_only=True,
-        )
+        ),
     )
-    await toolkit.add_tool(
+    await add_tool_gated(
+        toolkit,
         FunctionTool(
             func=calculator,
             name="calculator",
             description="计算数学表达式的值，支持四则运算、幂、取余及常用数学函数",
             is_read_only=True,
-        )
+        ),
     )
-    await toolkit.add_tool(
+    await add_tool_gated(
+        toolkit,
         FunctionTool(
             func=python_interpreter,
             name="python_interpreter",
@@ -334,7 +344,7 @@ async def build_toolkit(session_id: str | None = None) -> Toolkit:
                 behavior=PermissionBehavior.ALLOW,
                 message="受限沙箱内执行 Python 代码，高危内建已封禁，默认放行。",
             ),
-        )
+        ),
     )
 
     # mail139：139邮箱 Skill 适配层（vendored 官方脚本 + 子进程调用）。
@@ -343,14 +353,15 @@ async def build_toolkit(session_id: str | None = None) -> Toolkit:
     from .mail139 import build_mail139_tool, mail139_available
 
     if mail139_available():
-        await toolkit.add_tool(build_mail139_tool())
+        await add_tool_gated(toolkit, build_mail139_tool())
 
     # save_memory：需要会话上下文（GM session 绑定），且记忆功能已启用才注册
     if session_id:
         from .. import memory_client
 
         if memory_client.memory_enabled():
-            await toolkit.add_tool(
+            await add_tool_gated(
+                toolkit,
                 FunctionTool(
                     func=_make_save_memory(session_id),
                     name="save_memory",
@@ -358,6 +369,18 @@ async def build_toolkit(session_id: str | None = None) -> Toolkit:
                     # 用户已明确要求记住=已授权，且不动本地文件系统，
                     # 标 read-only 走权限快速通道（DEFAULT 模式下否则会被 ASK 拦截）
                     is_read_only=True,
-                )
+                ),
             )
+
+    # gm-memory MCP：GeneralMemory 只读三件套（memory_search /
+    # memory_task_status / memory_profile），共享 stdio 连接由
+    # app.mcp_manager 随 lifespan 管理。连接不可用时静默缺席（降级，
+    # 不影响其它工具）；工具本身若被判 ASK/DENY 则 strict 抛错——
+    # MCP 工具全部标注 readOnlyHint=True，正常应恒 ALLOW。
+    from ..mcp_manager import get_mcp_tools, mcp_enabled
+
+    if mcp_enabled():
+        for mcp_tool in await get_mcp_tools():
+            await add_tool_gated(toolkit, mcp_tool, strict=False)
+
     return toolkit

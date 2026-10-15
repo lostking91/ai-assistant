@@ -9,11 +9,68 @@ const props = defineProps({
   streaming: { type: Boolean, default: false },
   toolCalls: { type: Array, default: () => [] },
   error: { type: String, default: '' },
+  // 本轮记忆/画像召回明细（memory SSE 事件原样透传），null=本轮未召回
+  memory: { type: Object, default: null },
+  // 记忆/画像检索进行中（memory_start 已到、memory 未到）
+  recallLoading: { type: Boolean, default: false },
 })
 
 const bodyRef = ref(null)
 
+// ---- "本轮记忆"面板 ----
+const memoryOpen = ref(false)
+
 const isUser = computed(() => props.role === 'user')
+
+// 面板是否有可展示内容：有记忆条目或画像条目（或召回中）才显示入口
+const hasMemoryPanel = computed(() => {
+  if (props.recallLoading) return true
+  const m = props.memory
+  if (!m) return false
+  return (
+    (m.memory_items || []).length > 0 ||
+    (m.profile_items || []).length > 0 ||
+    m.memory_degraded ||
+    m.profile_degraded
+  )
+})
+
+// 面板入口摘要文案，如"召回 5 条记忆 · 16 条画像"
+const memorySummary = computed(() => {
+  const m = props.memory
+  if (!m) return ''
+  const parts = []
+  const memN = (m.memory_items || []).length
+  const profN = (m.profile_items || []).length
+  if (memN) parts.push(`${memN} 条记忆`)
+  if (profN) parts.push(`${profN} 条画像`)
+  if (!parts.length && (m.memory_degraded || m.profile_degraded)) parts.push('本轮未召回')
+  return parts.join(' · ')
+})
+
+// 记忆类型标签
+function memKindLabel(t) {
+  return t === 'inference' ? '推断' : '事实'
+}
+// 画像类型标签
+function profKindLabel(k) {
+  return k === 'inferred' ? '推断' : '明说'
+}
+function simText(s) {
+  return s == null ? '' : `${Math.round(s * 100)}%`
+}
+// 降级原因转人话
+const DEGRADE_LABELS = {
+  query_too_short: '问题太短，未检索',
+  read_disabled_or_unconfigured: '记忆检索未启用',
+  profile_disabled_or_unconfigured: '画像未启用',
+  timeout: '超时',
+}
+function degradeText(degraded, reason) {
+  if (!degraded) return ''
+  const r = String(reason || '')
+  return DEGRADE_LABELS[r] || `降级（${r}）`
+}
 
 // 工具名 / 状态中文映射
 const TOOL_LABELS = {
@@ -138,6 +195,61 @@ watch(() => props.streaming, highlight)
         <!-- 错误提示 -->
         <div v-if="error" class="msg__error">
           <strong>出错了：</strong>{{ error }}
+        </div>
+
+        <!-- 本轮记忆面板（AI 消息专属，可展开查看召回的记忆与画像） -->
+        <div v-if="!isUser && hasMemoryPanel" class="mem-panel">
+          <button class="mem-panel__toggle" @click="memoryOpen = !memoryOpen">
+            <span class="mem-panel__icon">🧠</span>
+            <span v-if="recallLoading && !memory">正在回忆…</span>
+            <span v-else>本轮记忆<template v-if="memorySummary">：{{ memorySummary }}</template></span>
+            <span class="mem-panel__arrow" :class="{ 'is-open': memoryOpen }">▾</span>
+          </button>
+
+          <div v-if="memoryOpen && memory" class="mem-panel__body">
+            <!-- 记忆条目 -->
+            <div v-if="(memory.memory_items || []).length" class="mem-sec">
+              <div class="mem-sec__title">
+                长期记忆
+                <span class="mem-sec__meta">
+                  {{ memory.memory_hits }} 条 · {{ memory.memory_elapsed_ms }}ms
+                </span>
+              </div>
+              <div v-for="(it, i) in memory.memory_items" :key="'m' + i" class="mem-item">
+                <span class="mem-tag" :class="it.cognitive_type === 'inference' ? 'mem-tag--infer' : 'mem-tag--fact'">
+                  {{ memKindLabel(it.cognitive_type) }}
+                </span>
+                <span v-if="it.similarity != null" class="mem-item__sim">{{ simText(it.similarity) }}</span>
+                <span class="mem-item__text">{{ it.content }}</span>
+              </div>
+            </div>
+
+            <!-- 画像条目 -->
+            <div v-if="(memory.profile_items || []).length" class="mem-sec">
+              <div class="mem-sec__title">
+                用户画像
+                <span class="mem-sec__meta">
+                  {{ memory.profile_hits }}<template v-if="memory.profile_total > memory.profile_hits">/{{ memory.profile_total }}</template> 条
+                  · {{ memory.profile_elapsed_ms }}ms
+                </span>
+              </div>
+              <div v-for="(p, i) in memory.profile_items" :key="'p' + i" class="mem-item">
+                <span class="mem-tag" :class="p.assertion_kind === 'inferred' ? 'mem-tag--infer' : 'mem-tag--fact'">
+                  {{ profKindLabel(p.assertion_kind) }}
+                </span>
+                <span class="mem-item__text">{{ p.key ? p.key + '：' : '' }}{{ p.value }}</span>
+                <span v-if="(p.business_domains || []).length" class="mem-item__domains">
+                  {{ p.business_domains.join(' / ') }}
+                </span>
+              </div>
+            </div>
+
+            <!-- 降级说明 -->
+            <div v-if="memory.memory_degraded || memory.profile_degraded" class="mem-degrade">
+              <span v-if="memory.memory_degraded">记忆：{{ degradeText(true, memory.memory_reason) }}</span>
+              <span v-if="memory.profile_degraded">画像：{{ degradeText(true, memory.profile_reason) }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -317,6 +429,136 @@ watch(() => props.streaming, highlight)
   &__state {
     color: var(--color-text-hint);
   }
+}
+
+// ---- 本轮记忆面板 ----
+.mem-panel {
+  margin-top: 8px;
+  width: fit-content;
+  max-width: 100%;
+
+  &__toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--color-text-secondary);
+    background: var(--color-input-bg);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+
+    &:hover {
+      border-color: var(--color-primary);
+      color: var(--color-text);
+    }
+  }
+
+  &__icon {
+    font-size: 12px;
+  }
+
+  &__arrow {
+    font-size: 10px;
+    transition: transform 0.2s;
+
+    &.is-open {
+      transform: rotate(180deg);
+    }
+  }
+
+  &__body {
+    margin-top: 6px;
+    padding: 10px 14px;
+    min-width: 320px;
+    background: var(--color-card);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-card);
+    animation: fadeIn 0.2s ease-out;
+  }
+}
+
+.mem-sec {
+  & + & {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--color-border);
+  }
+
+  &__title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  &__meta {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--color-text-hint);
+  }
+}
+
+.mem-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+
+  &__sim {
+    flex-shrink: 0;
+    font-size: 11px;
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    color: var(--color-primary);
+  }
+
+  &__text {
+    word-break: break-word;
+  }
+
+  &__domains {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--color-text-hint);
+  }
+}
+
+.mem-tag {
+  flex-shrink: 0;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  border-radius: 4px;
+
+  &--fact {
+    color: #237804;
+    background: #f6ffed;
+    border: 1px solid #b7eb8f;
+  }
+
+  &--infer {
+    color: #874d00;
+    background: #fffbe6;
+    border: 1px solid #ffe58f;
+  }
+}
+
+.mem-degrade {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--color-text-hint);
 }
 
 @keyframes fadeIn {

@@ -86,6 +86,31 @@ class Settings(BaseSettings):
     # 短于该字符数不检索（"你好""继续"这类无检索价值）
     memory_read_min_query_chars: int = 2
 
+    # ---- GeneralMemory 用户画像注入（2026-10-15 新增，与记忆检索并行） ----
+    # 每轮对话在记忆检索的同时拉取 GET /api/v1/profiles（用 ai_assistant 接入凭证，
+    # 管理凭证读 profiles 会 403），渲染进 system_prompt 的"# 用户画像"小节。
+    # 画像是 GM 治理链路沉淀的长期用户属性（如"用户名叫老王""偏好简洁表格"），
+    # 与 query 无关、每轮全量返回，故按条数上限截断注入。
+    memory_profile_enabled: bool = True
+    # include_inferred=true 时同时返回系统推断画像（assertion_kind=inferred，低置信度）；
+    # GM 侧还受 MEMORY_PROFILE_ALLOW_INFERRED 环境变量门禁（已在 GM .env 开启）。
+    memory_profile_include_inferred: bool = True
+    # 注入 prompt 的画像条数上限（GM 端点无 limit 参数，客户端截断；当前实测 16 条）
+    memory_profile_limit: int = 20
+    # 画像拉取独立超时（毫秒）。实测稳态 0.3-0.9s；GM 重启后首次请求可能挂起 60s，
+    # 超时即降级为"本轮无画像"，绝不阻塞对话。
+    memory_profile_timeout_ms: int = 2500
+
+    # ---- gm-memory MCP（GeneralMemory 只读工具的 MCP 封装，stdio 子进程） ----
+    # 开启后模型可主动检索长期记忆/查任务状态/查画像（mcp__gm-memory__* 三工具）。
+    # 与自动记忆注入（memory_read_*）互补：注入是"系统每轮自动附带"，
+    # MCP 是"模型按需主动查询"。写入仍走 save_memory + outbox，不经 MCP。
+    mcp_gm_memory_enabled: bool = True
+    # 逗号分隔的 server 侧工具名白名单（空=全部启用）
+    mcp_gm_memory_tools: str = ""
+    # MCP 工具执行超时（秒），同时透传给 server 作 GM HTTP 超时
+    mcp_gm_memory_timeout_s: float = 15.0
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

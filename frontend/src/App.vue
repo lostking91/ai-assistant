@@ -180,6 +180,9 @@ async function onSend(text) {
     streaming: true,
     toolCalls: [],
     error: '',
+    // 本轮记忆/画像召回明细（memory 事件到达后填充；recallLoading 供面板显示"正在回忆"）
+    memory: null,
+    recallLoading: false,
   })
   // 关键：必须取回数组里的 reactive proxy 再修改。
   // 若直接改 push 进去的原始对象，Vue 3 追踪不到，delta 不会触发重渲染
@@ -203,6 +206,14 @@ async function onSend(text) {
           if (ev.session_id) currentSessionId.value = ev.session_id
           // meta 之后就进入本轮对话，resume 归位
           resumeFlag.value = false
+        },
+        onMemoryStart: () => {
+          aiMsg.recallLoading = true
+        },
+        onMemory: (ev) => {
+          // 完整召回明细（记忆 + 画像），供气泡下"本轮记忆"面板展示
+          aiMsg.memory = ev
+          aiMsg.recallLoading = false
         },
         onToolStart: (ev) => {
           flushDelta()

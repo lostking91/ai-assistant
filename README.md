@@ -2,11 +2,25 @@
 
 基于 **AgentScope 2.x + FastAPI + Vue 3** 的对话式 AI 助手。后端运行 ReAct 智能体（通义千问 `qwen-plus`），前端为暖色现代风格（方案3 · Anthropic Custom）的聊天界面，支持流式输出、工具调用、Markdown 渲染、会话持久化与历史会话管理。
 
-> 本项目是「记忆服务集成」系列任务的载体：**任务1（AI 助手 Demo）已完成**；**任务2（GeneralMemory 接入）写入侧 + 读取侧均已完成**——写入走 `save_memory` 工具 + 回合结束钩子两条路径，读取走「每轮检索长期记忆并动态注入 system_prompt」的无工具召回。详见[十二、GeneralMemory 记忆接入](#十二generalmemory-记忆接入)与文末[后续规划](#十四后续规划)。
+> 本项目是「记忆服务集成」系列任务的载体：**任务1（AI 助手 Demo）已完成**；**任务2（GeneralMemory 接入）写入侧 + 读取侧均已完成**——写入走 `save_memory` 工具 + 回合结束钩子两条路径，读取走「每轮**并行**检索长期记忆 + 用户画像并动态注入 system_prompt」的无工具召回（v1.3.1 起双通道），且召回明细在前端「本轮记忆」面板对用户可见。详见[十二、GeneralMemory 记忆接入](#十二generalmemory-记忆接入)与文末[后续规划](#十四后续规划)。
 
-### 版本：v1.2.0（2026-10-15）
+### 版本：v1.3.1（2026-10-15）
 
-相对 v1.1.1 的三项主要改造：
+相对 v1.3.0 的两项主要改造（记忆召回 → 记忆+画像双通道，且召回过程对用户可见）：
+
+| # | 改造 | 内容 | 影响面 |
+|---|---|---|---|
+| 1 | **用户画像自动注入（后端）** | 每轮召回时与记忆检索**并行**拉取 GM 画像（`GET /api/v1/profiles?include_inferred=true`），渲染为「# 用户画像」小节注入 system_prompt；两路**独立降级**互不拖累；召回明细（记忆+画像）经 SSE `memory` 事件结构化透传 | `memory_retriever.py`、`agent.py`、`config.py`、`.env.example` |
+| 2 | **「本轮记忆」可展开面板（前端）** | AI 气泡内新增 🧠 面板：召回中显示"正在回忆…"，完成后显示"本轮记忆：N 条记忆 · M 条画像"，点开可逐条查看记忆（事实/推断+相似度+耗时）与画像（明说/推断+业务域），降级时显示原因 | `MessageBubble.vue`、`ChatWindow.vue`、`App.vue`、`api/chat.js` |
+
+> v1.3.0 的两项改造（gm-memory MCP server、工具权限门禁）见下表（保留）：
+
+| # | 改造 | 内容 | 影响面 |
+|---|---|---|---|
+| 1 | **gm-memory MCP server（任务4 完成）** | 自研 stdio 形态 MCP server（FastMCP）封装 GM 三个只读端点，模型可按需主动查记忆/任务状态/画像；共享连接随 lifespan 启停，GM 侧零改动、不占新端口 | `mcp_server/gm_memory_server.py`(新)、`app/mcp_manager.py`(新)、`builtin_tools.py`、`agent.py`、`main.py`、`config.py` |
+| 2 | **工具权限门禁（机制化根治"无声卡死"）** | 所有工具进 Toolkit 前用**生产同款权限引擎**预跑判定，ASK/DENY 拒绝注册（启动期抛错）；配套审计脚本与 `/api/permissions` 端点随时输出权限矩阵 | `app/tools/permission_gate.py`(新)、`builtin_tools.py`、`main.py`、`scripts/verify_permissions.py`(新) |
+
+> v1.2.0 的三项改造（读侧切 GM API、移除 memory_link、集成 139邮箱）见下表（保留）：
 
 | # | 改造 | 内容 | 影响面 |
 |---|---|---|---|
@@ -49,7 +63,10 @@
 │                      │  <────────────────────────  │                          │
 │  Element Plus UI     │      流式事件 (SSE)          │  AgentScope 2.x ReAct    │
 │  marked + hljs 渲染   │                             │   ├─ DashScope qwen-plus │
-└─────────────────────┘                             │   ├─ Toolkit（最多5工具） │
+└─────────────────────┘                             │   ├─ Toolkit（8工具，全经  │
+                                                     │   │   权限门禁注册）        │
+                                                     │   │   └─ gm-memory MCP   │
+                                                     │   │      (stdio 子进程)   │
                                                      │   └─ AgentState 持久化    │
                                                      │            │             │
                                                      │            ▼             │
@@ -102,19 +119,25 @@ ai-assistant/
 │   │   └── assistant.db          # SQLite 数据库（运行时自动创建）
 │   └── app/
 │       ├── __init__.py
-│       ├── main.py               # FastAPI 入口，路由与 lifespan（启动时 flush outbox）
-│       ├── config.py             # 配置（读取 .env，含 GM 记忆读写配置项）
+│       ├── main.py               # FastAPI 入口，路由与 lifespan（flush outbox + MCP 启停）
+│       ├── config.py             # 配置（读取 .env，含 GM 记忆读写与 MCP 配置项）
 │       ├── models.py             # 请求/响应 Pydantic 模型
 │       ├── agent.py              # AgentScope 智能体封装、会话管理、流式对话、回合记忆钩子、记忆召回注入
 │       ├── database.py           # SQLite 持久化（sessions + memory_outbox）
 │       ├── memory_client.py      # GM 写入侧客户端（契约适配、outbox 投递、结果归纳）
-│       ├── memory_retriever.py   # GM 读取侧客户端（双后端 gm_api/local，向量检索+证据链，渲染 system_prompt 片段）
+│       ├── memory_retriever.py   # GM 读取侧客户端（记忆+画像双通道并行召回、独立降级，渲染 system_prompt 片段）
+│       ├── mcp_manager.py        # gm-memory MCP 共享连接管理（随 lifespan 启停，断线重连，v1.3.0 新增）
 │       └── tools/
 │           ├── __init__.py
-│           ├── builtin_tools.py  # 内置工具实现（get_current_time/calculator/python_interpreter/save_memory + mail139 装配）
+│           ├── builtin_tools.py  # 内置工具实现（get_current_time/calculator/python_interpreter/save_memory + mail139 装配 + MCP 注册）
+│           ├── permission_gate.py # 工具权限门禁（注册前用生产同款引擎强制校验，v1.3.0 新增）
 │           └── mail139.py        # 139邮箱 Skill 适配层（子进程调用 vendored 官方脚本，flag 黑名单+两步确认）
+│   ├── mcp_server/
+│   │   └── gm_memory_server.py   # gm-memory MCP server（FastMCP stdio，GM 只读三工具，v1.3.0 新增）
 │   ├── scripts/
-│   │   └── c_step_agent_id_test.py  # GM agent_id/source_system 过滤实测脚本（可重跑）
+│   │   ├── c_step_agent_id_test.py  # GM agent_id/source_system 过滤实测脚本（可重跑）
+│   │   ├── smoke_gm_mcp.py          # gm-memory MCP stdio 冒烟测试（connect→list→审计→真实调用）
+│   │   └── verify_permissions.py    # 权限审计脚本（离线输出全量权限矩阵，退出码即结论）
 │   └── skills/
 │       └── 139-mail/             # vendored 官方 139邮箱 Skill 包（运行依赖，凭据文件已 .gitignore）
 ├── frontend/                     # 前端（Vue 3 + Vite）
@@ -134,7 +157,7 @@ ai-assistant/
 │       └── components/
 │           ├── SessionSidebar.vue  # 左侧会话栏（分组、重命名、删除）
 │           ├── ChatWindow.vue      # 消息列表区（自动滚动、欢迎页）
-│           ├── MessageBubble.vue   # 消息气泡（Markdown、工具调用、流式光标）
+│           ├── MessageBubble.vue   # 消息气泡（Markdown、工具调用、流式光标、「本轮记忆」可展开面板）
 │           └── InputArea.vue       # 输入框（自适应高度、Enter 发送）
 └── design-demos/                 # UI 设计稿（参考用）
     ├── 1-gallery-dark.html       # 方案1
@@ -169,13 +192,18 @@ ai-assistant/
 | outbox 可靠投递      | 先落 SQLite 再投递，幂等键重试，重启自动补发                               | ✅（任务2） |
 | 记忆召回注入           | 每轮对话前检索长期记忆并动态注入 system_prompt（v1.2.0 默认走 GM API）        | ✅（v1.2.0） |
 | `mail139` 工具     | 139邮箱 Skill：搜索/阅读/发送邮件、附件、日程、通讯录、网盘（vendored 官方包+适配层）  | ✅（v1.2.0） |
+| `gm-memory` MCP server | 自研 stdio MCP server 封装 GM 只读三工具（memory_search / memory_task_status / memory_profile），模型可按需主动查记忆 | ✅（v1.3.0） |
+| 工具权限门禁           | 所有工具注册前经生产同款权限引擎强制校验，ASK/DENY 拒绝注册；`/api/permissions` 端点 + `verify_permissions.py` 脚本随时出权限矩阵 | ✅（v1.3.0） |
+| 用户画像自动注入         | 每轮召回与记忆检索**并行**拉取 GM 画像（含 inferred），渲染「# 用户画像」小节注入 system_prompt；两路独立降级互不拖累 | ✅（v1.3.1） |
+| 「本轮记忆」可展开面板      | AI 气泡内 🧠 面板：召回中"正在回忆…"→ 完成后"N 条记忆 · M 条画像"，逐条可查（事实/推断、相似度、耗时、业务域），降级显示原因 | ✅（v1.3.1） |
 
 ### 待实现（后续任务）
 
 | 功能                             | 所属任务      | 状态      |
 | ------------------------------ | --------- | ------- |
-| `gm-memory` MCP server（GM 官方暂缓 MCP，当前以 HTTP API 直调替代） | 任务4 | ⏳ |
 | 记忆管理平台                         | 任务3       | ⏳ 主体已在 memory-platform 项目落地 |
+
+> 原「任务4：gm-memory MCP server」已于 v1.3.0 完成——GM 官方虽暂缓 MCP，本项目以**自研 stdio MCP server 封装 GM HTTP API** 的形态落地（GM 侧零改动），而非等待官方实现。
 
 > 原「任务2 延后项：检索/召回侧」已完成——采用**无工具召回**（每轮自动检索注入 system_prompt）而非 `search_memory` 工具，相关性判定交给对话模型本身，避免多一轮 LLM 往返。
 
@@ -207,6 +235,7 @@ ai-assistant/
 | dashscope         | 1.27.7  | 通义千问 SDK                 |
 | httpx             | 0.28.1  | GM 记忆服务 HTTP 客户端（读写两侧） |
 | psycopg           | 3.3.6   | 读侧 `local` 后端直连 GM Postgres（回退用） |
+| mcp               | 1.30.0  | Model Context Protocol SDK（gm-memory MCP server + AgentScope MCPClient，v1.3.0 起显式声明） |
 | requests / cryptography / keyring | ≥2.31 / ≥42 / ≥25 | 139邮箱 Skill（vendored）依赖，v1.2.0 新增 |
 
 ### 前端 npm 包（`frontend/node_modules`）
@@ -393,6 +422,27 @@ npm run dev
 
 > **已删除的死配置**（v1.2.0）：`MEMORY_LINK_GUARD_ENABLED`、`MEMORY_LINK_MAX_GENERATION`、`MEMORY_LINK_MAX_ROTATE_PER_ITEM` —— 对应的会话轮换守护逻辑随 GM `a43b3ad` 修复一并移除。
 
+### 用户画像配置（v1.3.1 新增）
+
+| 变量                        | 默认值      | 说明                                                         |
+| ------------------------- | -------- | ---------------------------------------------------------- |
+| `MEMORY_PROFILE_ENABLED`  | `true`   | 画像注入总开关（还需 `GM_BASE_URL`+`GM_TOKEN` 齐全才生效）。关闭后仅记忆召回，画像路降级 `profile_disabled_or_unconfigured` |
+| `MEMORY_PROFILE_INCLUDE_INFERRED` | `true` | 是否包含治理推断出的画像（inferred）。需 GM 侧 `MEMORY_PROFILE_ALLOW_INFERRED=true` 才有 inferred 数据 |
+| `MEMORY_PROFILE_LIMIT`    | `20`     | 注入条数上限。GM profiles 端点无 limit 参数，客户端截断：explicit 优先排序后取前 N |
+| `MEMORY_PROFILE_TIMEOUT_MS` | `2500` | 画像拉取超时；超时独立降级为「本轮无画像」，**不影响记忆召回**                          |
+
+> 画像拉取复用 `.env` 的 `GM_TOKEN`（ai_assistant 接入凭证）。注意**凭证边界**：该凭证走 `read_user_memory` 权限可查 profiles；GM 管理凭证查 `/profiles` 会 403。
+
+### gm-memory MCP 配置（v1.3.0 新增）
+
+| 变量                        | 默认值      | 说明                                                         |
+| ------------------------- | -------- | ---------------------------------------------------------- |
+| `MCP_GM_MEMORY_ENABLED`   | `true`   | MCP 记忆工具总开关（还需 `MEMORY_ENABLED=true` 且 server 脚本存在才生效）      |
+| `MCP_GM_MEMORY_TOOLS`     | （空=全部）  | 工具白名单（逗号分隔 server 侧原始名）：`memory_search,memory_task_status,memory_profile` |
+| `MCP_GM_MEMORY_TIMEOUT_S` | `15`     | MCP 工具执行超时（秒），同时透传给 server 作 GM HTTP 超时                    |
+
+> MCP server 复用 `.env` 的 `GM_BASE_URL`/`GM_TOKEN`/`GM_USER_ID`（经 stdio 子进程 env 注入，token 不落命令行）。子进程用后端自身 venv python（`sys.executable`）拉起；`mcp` SDK（1.30.0）随 agentscope 依赖已在 venv 中，无需额外安装。
+
 
 > `has_api_key` 判定逻辑：密钥非空且不以 `YOUR_` 开头才视为已配置。
 
@@ -407,6 +457,7 @@ npm run dev
 | 方法     | 路径                            | 说明                        |
 | ------ | ----------------------------- | ------------------------- |
 | GET    | `/api/health`                 | 健康检查（含模型、API Key 状态、工具列表） |
+| GET    | `/api/permissions`            | 权限审计：输出全量工具权限矩阵（可带 `?session_id=` 纳入 save_memory），v1.3.0 新增 |
 | POST   | `/api/chat`                   | 非流式对话                     |
 | POST   | `/api/chat/stream`            | 流式对话（SSE）                 |
 | GET    | `/api/sessions?limit=50`      | 会话列表（按最近更新排序）             |
@@ -464,10 +515,12 @@ npm run dev
 | type          | 载荷字段                                                           | 说明          |
 | ------------- | -------------------------------------------------------------- | ----------- |
 | `meta`        | `session_id, is_new_session, title`                            | 本轮元信息（最先发出） |
+| `memory_start` | （无载荷）                                                          | 开始记忆/画像召回（记忆或画像任一开关开启即发出；前端显示"正在回忆…"），v1.3.1 扩展 |
+| `memory`      | `memory_hits, memory_elapsed_ms, memory_degraded, memory_reason, memory_items[{content, cognitive_type, similarity}], profile_hits, profile_total, profile_elapsed_ms, profile_degraded, profile_reason, profile_items[{key, value, assertion_kind, business_domains}]` | 本轮召回明细（记忆+画像双通道，结构化透传给前端「本轮记忆」面板），v1.3.1 扩展 |
 | `tool_start`  | `name`                                                         | 开始调用某工具     |
 | `tool_result` | `name, state`                                                  | 工具调用结束及状态   |
 | `delta`       | `text`                                                         | 文本增量（逐字）    |
-| `done`        | `reply, tool_calls, session_id, title, finished_reason, error` | 本轮完成        |
+| `done`        | `reply, tool_calls, session_id, title, finished_reason, error, memory` | 本轮完成（`memory` 为召回明细字典，与 `memory` 事件同源） |
 | `error`       | `message`                                                      | 出错（如未配 Key） |
 
 **SSE 测试示例**：
@@ -532,6 +585,9 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 | `python_interpreter` | `code: str`       | 受限沙箱执行 Python 代码，返回 stdout/stderr/异常          | **禁用高危内建**（`open/exec/eval/__import__/input` 等）；显式 ALLOW |
 | `mail139`            | `action, args`    | 139邮箱：搜索/阅读/发送/草稿/附件/日程/通讯录/网盘/待办（vendored 官方 Skill 子进程调用，v1.2.0 新增） | skill 自带 confirm_token 两步确认 + 适配层 flag 黑名单（禁 `--scheduled`/`--base-url`）+ 路径锁定工作目录；显式 ALLOW |
 | `save_memory`        | `content: str`    | 把用户明确要求记住的信息同步保存到 GM 长期记忆                     | 仅在**有会话上下文且记忆功能启用**时注册；标 `is_read_only` 走权限快速通道 |
+| `mcp__gm-memory__memory_search` | `query: str, limit: int=5` | 语义检索长期记忆（GM `memories:search`，`use_model=false`，v1.3.0 新增） | MCP 只读工具（`readOnlyHint=True`）→ 引擎自动 ALLOW |
+| `mcp__gm-memory__memory_task_status` | `task_id: str` | 查询 GM 记忆写入任务的执行状态（v1.3.0 新增） | 同上，只读 |
+| `mcp__gm-memory__memory_profile` | `include_inferred: bool=False` | 查询 GM 沉淀的用户画像（v1.3.0 新增） | 同上，只读 |
 
 **calculator 示例**：`"2 + 3 * 4"` → `14`；`"sqrt(144)"` → `12`
 
@@ -542,6 +598,21 @@ GM 写入侧发件箱：回合结束后先落库再异步投递，进程重启�
 **save_memory 说明**：系统提示词约束——仅当用户明确表达"记住/记一下/以后记得"等意图时调用；content 须是完整、独立可理解的事实陈述；一次只保存一个主题。工具返回值按 GM 任务结果语义区分"保存成功/重复未新增/处理中/失败"，并明确指示模型**不得虚报保存成功**。详见[第十二章](#十二generalmemory-记忆接入)。
 
 > 记忆检索**不设工具**：召回在每轮对话前自动执行并注入 system_prompt（见 12.6），相关性判定交给对话模型本身，省一轮 LLM 往返。
+
+**gm-memory MCP 工具说明（v1.3.0）**：与自动召回互补——注入是"系统每轮自动附带"，MCP 工具是"模型按需主动查询"（如用户问"你还记得我说过……吗"或需核实注入未覆盖的历史事实）。server 为 `backend/mcp_server/gm_memory_server.py`（FastMCP stdio 子进程），由 `app/mcp_manager.py` 在后端启动时拉起共享连接、退出时回收；连接失败仅降级（MCP 工具缺席，不影响其它工具与会话）。**有意只暴露只读工具**：写入仍走 `save_memory` + outbox（MCPTool 每次调用临时构造拿不到 session_id 闭包，且写侧需要本地 SQLite 事务语义）。工具层永不抛异常，GM 错误被转成 `{"ok": false, "error": ...}` 可读结论。
+
+### 工具权限门禁（v1.3.0，"无声卡死"的机制化解法）
+
+**背景**：AgentScope 2.0.9 DEFAULT 权限模式下，未显式声明权限的工具被判 ASK → 工具 park 等待人工确认 → 前端无确认 UI → SSE 只发 `tool_start` 不发 `tool_result`，表现为无声卡死（v1.1.1 踩坑）。此前靠"记得给每个工具加 ALLOW"的人肉约定防坑，v1.3.0 起改为**机器强制**：
+
+1. **注册门禁**（`app/tools/permission_gate.py`）：`build_toolkit` 中所有工具（含 MCP）一律经 `add_tool_gated()` 注册——用**生产同款引擎**（`PermissionEngine(AgentState().permission_context)`，与 `Agent.__init__` 的构造完全同源，是复刻不是近似）在注册前预跑 `check_permission`：
+   - ALLOW → 放行注册 + INFO 日志；
+   - ASK/DENY → **拒绝注册** + ERROR 日志；`strict=True` 时直接抛 `PermissionGateError`（启动期暴露，绝不带病上线）。会卡死的工具根本进不了 toolkit，模型看不到。
+2. **审计脚本**：`./venv/Scripts/python.exe scripts/verify_permissions.py` 离线输出全量权限矩阵（含 save_memory/mail139/MCP 三工具），退出码 0=全 ALLOW、1=存在风险项；发布前跑一遍即可。
+3. **审计端点**：`GET /api/permissions?session_id=xxx` 对运行中服务实时输出同一矩阵（`all_allow` 字段即结论），只评估不执行、无副作用。
+4. **MCP 天然安全路径**：gm-memory 三工具全部标注 `readOnlyHint=True` → `MCPTool.is_read_only=True` → 引擎只读快速通道自动 ALLOW；门禁仍会复核。
+
+> 新增工具的强制流程：FunctionTool 必须标 `is_read_only=True`（只读语义）或传 `permission=PermissionDecision(behavior=ALLOW, ...)`（有副作用但可信，写明理由），否则启动即失败。当前矩阵：8 工具全 ALLOW（见 `verify_permissions.py` 实测输出）。
 
 ---
 
@@ -617,6 +688,12 @@ MEMORY_READ_ENABLED=true
 MEMORY_READ_BACKEND=gm_api          # gm_api（推荐）| local（直连 PG 自建检索，回退用）
 MEMORY_READ_LIMIT=5
 MEMORY_READ_TIMEOUT_MS=2500
+
+# ---- 用户画像注入（v1.3.1）----
+MEMORY_PROFILE_ENABLED=true
+MEMORY_PROFILE_INCLUDE_INFERRED=true
+MEMORY_PROFILE_LIMIT=20
+MEMORY_PROFILE_TIMEOUT_MS=2500
 ```
 
 `GM_TOKEN` 为空时记忆功能整体静默禁用（`save_memory` 不注册、钩子不投递、召回不执行），助手其余功能不受影响。
@@ -682,7 +759,8 @@ MEMORY_READ_TIMEOUT_MS=2500
 **关键设计**：
 - **不设 `search_memory` 工具**——召回自动执行、结果作为数据注入 prompt，相关性判定交给对话模型本身（模型本来就要推理，零额外延迟；设工具则每次召回多一轮 LLM 往返）。
 - **绝不抛异常给对话链路**：超时（`MEMORY_READ_TIMEOUT_MS=2500`）、GM 非 2xx、任何异常都降级为「本轮无记忆」，只记 debug 日志。
-- **短输入跳过**：用户输入 < `MEMORY_READ_MIN_QUERY_CHARS=2` 不检索。
+- **短输入跳过**：用户输入 < `MEMORY_READ_MIN_QUERY_CHARS=2` 不检索（但**画像仍注入**——画像与 query 无关，见 12.11）。
+- **v1.3.1 起为双通道**：`recall()` 内 `asyncio.gather` 并行执行记忆检索与画像拉取，详见 [12.11](#1211-用户画像注入与本轮记忆面板v131)。
 
 ### 12.7 agent_id / source_system 过滤语义（实测固化）
 
@@ -735,6 +813,63 @@ MEMORY_READ_TIMEOUT_MS=2500
     -c "SELECT status, payload->'execution'->'diagnostics' FROM memory_task ORDER BY created_at DESC LIMIT 5;"
   ```
   > `docker exec` 执行 stdin SQL **必须带 `-i`**，否则 SQL 静默不执行且 exit 0。psql 用户是 `memory_cmic`（不是 postgres）。
+
+### 12.11 用户画像注入与「本轮记忆」面板（v1.3.1）
+
+**动机**：只有"事件记忆"召回时，助手不知道用户是谁（职业、偏好、常用地）。GM 的治理流程会从长期事实沉淀出**用户画像**（property），v1.3.1 起把它一并注入，让助手表现得像真实的个人助理。
+
+**并行双通道召回**（`memory_retriever.recall()`）：
+
+```
+                 ┌── _safe_memory_recall(query, uid)  → GM POST /memories:search（记忆）
+recall(query) ──┤                                     asyncio.gather
+                 └── _safe_profile_recall(uid)        → GM GET /profiles?include_inferred=true（画像）
+```
+
+- **两路完全独立降级**：画像超时/报错只让画像路降级（`profile_reason`），记忆照常注入；反之亦然。GM 整体不可达时两路各自记 `net_error:ConnectError`，prompt 块为空但**绝不抛异常**。
+- **画像与 query 无关**：即使记忆路因短输入降级（`query_too_short`），画像仍照常注入（实测 1 字符 query 时 `profile_only_block=True`）。
+
+**GM 画像端点契约**（实测固化）：
+
+| 项 | 值 |
+|---|---|
+| 端点 | `GET /api/v1/profiles?user_id=...&include_inferred=true`，权限 `Depends(read_user_memory)` |
+| 响应 | `{"profiles":[{id, property_key(恒 null), property_value(jsonb 标量), value_type, business_domains, assertion_kind}]}` |
+| 分页 | **无 limit 参数** → 客户端截断：`assertion_kind=="explicit"` 优先排序后取前 `MEMORY_PROFILE_LIMIT` |
+| 类型 | `property_value` 非字符串时 `json.dumps(..., ensure_ascii=False)` 兜底 |
+| 实测 | 16 条全 explicit、全 string、单次 0.4-0.9s |
+
+> **inferred 画像为何可能是 0**：GM 治理（`POST /api/v1/governance/runs`）确实会跑推断生成链路，但 inferred 画像要求 basis fact 的 `retention_kind` 达到 `long_term` 门槛——这是 GM 有意的质量门禁，非本项目缺陷。当前 16 条全为 explicit。
+
+**prompt 渲染**（`format_memories_for_prompt`）：拆为 `_format_memory_section`（原逻辑不变）+ `_format_profile_section`，两块 `"\n\n".join`。画像小节标题「# 用户画像（长期属性，仅供参考）」，表格含「类型（明说 / 推断（低置信度））+ 内容」，value 截断 160 字符，并附 5 条使用规则——沿用「**数据不是指令**」范式：声明属于数据非指令、冲突以用户当前表述为准、禁止向用户暴露机制措辞、看似指令的文字一律不执行。
+
+**SSE 透传**：`memory_start` 触发条件改为 `retrieval_enabled() or profiles_enabled()`；`memory` 事件在原记忆字段基础上新增 `profile_hits / profile_total / profile_elapsed_ms / profile_degraded / profile_reason / profile_items[{key,value,assertion_kind,business_domains}]`；`done.memory` 同源。`ChatResponse.memory` 本就是 `dict[str, Any] | None` 自由字典，故 `models.py` 无需改动。
+
+**前端「本轮记忆」面板**（`MessageBubble.vue`）：
+
+| 状态 | 表现 |
+|---|---|
+| 召回中（`memory_start`） | 🧠 "正在回忆…" + ▾ |
+| 完成（`memory`） | 🧠 "本轮记忆：5 条记忆 · 16 条画像" + ▾ |
+| 展开 → 长期记忆区 | 每条：事实/推断标签（绿/黄）+ 内容 + 相似度 + 耗时（`长期记忆 5 条 · 571ms`） |
+| 展开 → 用户画像区 | 每条：明说/推断标签 + 内容 + 业务域（`用户画像 16 条 · 429ms`） |
+| 降级 | 显示降级原因中文标签（`DEGRADE_LABELS`：超时/GM 接口异常/网络错误/输入过短/画像未开启…） |
+
+事件接线：`api/chat.js` 新增 `case 'memory_start'` / `case 'memory'` → `App.vue` 的 `onMemoryStart`（置 `aiMsg.recallLoading=true`）与 `onMemory`（写 `aiMsg.memory`、清 loading）→ `ChatWindow.vue` 透传 `:memory` / `:recall-loading` 给 `MessageBubble`。AI 占位消息新增 `memory: null, recallLoading: false` 两字段，且**必须先取回 reactive proxy 再改**（Vue 3 陷阱，见十三）。
+
+**E2E 验收记录（2026-10-15，Playwright + 真实 SSE）**：
+
+| 用例 | 结果 |
+|---|---|
+| 面板文案时序 | ✅ TOGGLE(early) "🧠 正在回忆… ▾" → TOGGLE(final) "🧠 本轮记忆：5 条记忆 · 16 条画像 ▾" |
+| 展开分区 | ✅ SECTIONS `["长期记忆 5 条 · 571ms","用户画像 16 条 · 429ms"]` |
+| 条目与标签 | ✅ ITEMS 21 条；TAGS = 5×事实 + 16×明说 |
+| SSE `memory` 事件 | ✅ `profile_hits:16 / profile_total:16 / profile_elapsed_ms:440 / profile_items` 16 条；`done.finished_reason:completed` |
+| 画像实际被运用 | ✅ 模型回复"您好，老王！…您偏好简洁的表格输出"，自然使用画像且未暴露机制措辞 |
+| 降级四场景 | ✅ 正常 / 短 query"你好" / 1 字符"你"（记忆 `query_too_short`、画像照注入）/ GM 不可达（双路 `net_error`、块空、不抛异常）/ 画像开关关闭（记忆照常、`profile_disabled_or_unconfigured`） |
+| 前端无报错 | ✅ PAGE_ERRORS none；`npm run build` 通过（21.12s）；截图 `memory_panel_ui.png` |
+
+> MCP 工具 `memory_profile` 自 v1.3.1 起定位为**兜底**：画像通常每轮已自动注入，仅在怀疑注入缺失或需全量核对时才由模型主动调用。
 
 ---
 
@@ -826,7 +961,7 @@ pip install -r requirements.txt -i https://pypi.org/simple
 | **任务2** | GeneralMemory 接入：写入侧（`save_memory` + 回合钩子 + outbox）           | ✅ 已完成（2026-10-09 E2E 验收通过） |
 | 任务2 读取侧 | 每轮召回注入 system_prompt；v1.2.0 起默认走 GM 官方 API（`use_model=false`） | ✅ 已完成（2026-10-15，7/7 等价性实测 + 真实召回验证） |
 | **任务3** | 记忆管理平台（运营监控）                                                   | ✅ 主体已在 `../memory-platform/` 落地（v1.1.2） |
-| **任务4** | 记忆服务插件化 → `gm-memory` MCP server                              | ⏳ GM 官方暂缓 MCP，当前以 HTTP API 直调替代；待启动 |
+| **任务4** | 记忆服务插件化 → `gm-memory` MCP server                              | ✅ 已完成（v1.3.0，2026-10-15：自研 stdio MCP server 封装 GM 只读三工具，端到端验证通过） |
 
 ---
 
@@ -842,4 +977,4 @@ pip install -r requirements.txt -i https://pypi.org/simple
 
 ---
 
-*最后更新：2026-10-15（v1.2.0：读侧切 GM API 双后端、移除 memory_link 会话守护、集成 139邮箱 Skill、GM 环境对齐 v2.6.0；新增 12.6 读取侧召回 / 12.7 agent_id 过滤语义 / 12.8 守护移除说明）*
+*最后更新：2026-10-15（v1.3.0：gm-memory MCP server 落地（stdio 只读三工具 + 共享连接管理）、工具权限门禁机制化（注册前生产同款引擎强制校验 + /api/permissions 审计端点 + verify_permissions.py 脚本）；v1.2.0：读侧切 GM API 双后端、移除 memory_link 会话守护、集成 139邮箱 Skill、GM 环境对齐 v2.6.0）*

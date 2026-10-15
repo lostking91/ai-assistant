@@ -49,6 +49,8 @@ export async function renameSession(sessionId, title) {
  * @param {object} payload        { message, session_id, resume }
  * @param {object} handlers       回调集合
  * @param {function} handlers.onMeta        ({session_id, is_new_session, title}) => void
+ * @param {function} handlers.onMemoryStart () => void  —— 开始检索记忆/画像
+ * @param {function} handlers.onMemory      (payload) => void  —— 记忆+画像召回明细
  * @param {function} handlers.onDelta       ({text}) => void
  * @param {function} handlers.onToolStart   ({name}) => void
  * @param {function} handlers.onToolResult  ({name, state}) => void
@@ -114,6 +116,12 @@ export async function chatStream(payload, handlers = {}, signal) {
       switch (event.type) {
         case 'meta':
           handlers.onMeta?.(event)
+          break
+        case 'memory_start':
+          handlers.onMemoryStart?.(event)
+          break
+        case 'memory':
+          handlers.onMemory?.(event)
           break
         case 'delta':
           handlers.onDelta?.(event)

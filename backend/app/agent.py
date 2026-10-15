@@ -86,14 +86,30 @@ BASE_SYSTEM_PROMPT = """你是一个友好、专业的中文 AI 助手，名字�
    - 返回"仍在后台处理中"或失败时，如实告知，绝不可承诺已保存。
 3. 用户没有明确要求记住时，不要主动调用 save_memory。
 4. 当前会话内的上下文你本来就能记住，无需为此调用工具。
-5. 系统会在需要时自动把检索到的历史记忆附在本提示词末尾（"# 检索到的长期记忆"小节）。
+5. 系统会在需要时自动把检索到的历史记忆附在本提示词末尾（"# 检索到的长期记忆"小节），
+   并可能附上"# 用户画像"小节（系统沉淀的长期用户属性，如称呼、格式偏好）。
    这些是长期记忆，跨会话有效，不需要调用任何工具去获取；
-   是否采用由你按该小节的使用规则自行判断。
+   是否采用由你按各小节的使用规则自行判断。
 """
 
 
+MCP_TOOLS_PROMPT = """# 记忆查询工具（gm-memory MCP）
+你还有三个只读工具可按需主动查询长期记忆（GeneralMemory）：
+- mcp__gm-memory__memory_search：语义检索长期记忆（如用户主动问"你还记得我说过……吗"、
+  或需要核实某条历史事实而本轮注入的"# 检索到的长期记忆"没有覆盖到时）。
+- mcp__gm-memory__memory_task_status：按 task_id 查询记忆写入任务的执行状态。
+- mcp__gm-memory__memory_profile：查询系统为你沉淀的用户画像（通常每轮已自动注入
+  "# 用户画像"小节，仅在怀疑注入缺失或需要全量核对时才调用）。
+使用规则：
+1. 优先使用每轮自动注入的"# 检索到的长期记忆"小节；只有注入内容不够、且确有查证必要时
+   才调用 memory_search，不要每轮都调。
+2. 这些工具只读，不会保存任何内容；用户要求"记住"时仍然用 save_memory。
+3. 工具返回 JSON：ok=true 时按 results 内容回答并注明来自长期记忆；ok=false 时如实
+   告知查询失败，不要编造记忆内容。"""
+
+
 def build_system_prompt(memory_block: str = "") -> str:
-    """按轮组装 system_prompt：基础人设 + 本轮检索到的记忆块。
+    """按轮组装 system_prompt：基础人设 + MCP 工具说明（若启用）+ 本轮记忆块。
 
     为什么可以安全地每轮动态注入（已查 AgentScope 2.0.9 源码验证）：
       - Agent._get_system_prompt() 在每次模型调用时动态拼装，system_prompt
@@ -102,9 +118,18 @@ def build_system_prompt(memory_block: str = "") -> str:
         user/assistant 两条消息）也就不会把注入的记忆再投递回 GM，
         避免"记忆自我循环增殖"。
     """
-    if not memory_block:
-        return BASE_SYSTEM_PROMPT
-    return f"{BASE_SYSTEM_PROMPT}\n\n{memory_block}"
+    from .mcp_manager import mcp_tools_ready
+
+    prompt = BASE_SYSTEM_PROMPT
+    # 用 mcp_tools_ready（而非 mcp_enabled）：连接失败降级时工具实际缺席，
+    # prompt 也就不介绍它们，避免模型去调不存在的工具名。
+    # 注意 _build_agent 中 build_toolkit() 先于本函数执行，故这里反映的是
+    # 本轮工具集的真实状态（含断线重连结果）。
+    if mcp_tools_ready():
+        prompt = f"{prompt}\n\n{MCP_TOOLS_PROMPT}"
+    if memory_block:
+        prompt = f"{prompt}\n\n{memory_block}"
+    return prompt
 
 
 
@@ -264,10 +289,11 @@ async def extract_history(session_id: str) -> tuple[str, list[dict[str, Any]]]:
 
 
 async def _recall_memory_block(message: str) -> tuple[str, dict[str, Any]]:
-    """检索长期记忆并渲染成 system_prompt 片段。
+    """检索长期记忆 + 用户画像，渲染成 system_prompt 片段。
 
-    返回 (memory_block, debug_info)。检索失败/超时/未启用时 memory_block 为空串，
-    对话照常进行（降级为"本轮无记忆"），绝不影响主链路。
+    返回 (memory_block, debug_info)。检索失败/超时/未启用时对应部分为空，
+    对话照常进行（降级为"本轮无记忆/无画像"），绝不影响主链路。
+    debug_info 会经 SSE memory 事件透传给前端"本轮记忆"面板（含画像明细）。
     """
     result = await memory_retriever.recall(message)
     block = memory_retriever.format_memories_for_prompt(result)
@@ -284,6 +310,21 @@ async def _recall_memory_block(message: str) -> tuple[str, dict[str, Any]]:
                 "similarity": round(m.similarity, 3) if m.similarity is not None else None,
             }
             for m in result.memories
+        ],
+        # ---- 画像明细（2026-10-15 新增，供前端"本轮记忆"面板展示） ----
+        "profile_hits": len(result.profiles),
+        "profile_total": result.profile_total,
+        "profile_elapsed_ms": result.profile_elapsed_ms,
+        "profile_degraded": result.profile_degraded,
+        "profile_reason": result.profile_reason,
+        "profile_items": [
+            {
+                "key": p.key,
+                "value": p.value,
+                "assertion_kind": p.assertion_kind,
+                "business_domains": p.business_domains,
+            }
+            for p in result.profiles
         ],
     }
     return block, debug
@@ -369,8 +410,8 @@ async def chat_stream(
         "title": title,
     }
 
-    # 记忆检索：先给前端一个"正在回忆"信号，再执行（实测 0.2-0.35s）
-    if memory_retriever.retrieval_enabled():
+    # 记忆检索 + 画像拉取（并行）：先给前端一个"正在回忆"信号，再执行（实测 0.2-0.9s）
+    if memory_retriever.retrieval_enabled() or memory_retriever.profiles_enabled():
         yield {"type": "memory_start"}
     memory_block, mem_debug = await _recall_memory_block(message)
     yield {"type": "memory", **mem_debug}

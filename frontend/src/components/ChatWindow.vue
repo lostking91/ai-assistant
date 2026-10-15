@@ -103,6 +103,8 @@ defineExpose({ scrollToBottom })
         :streaming="m.streaming"
         :tool-calls="m.toolCalls"
         :error="m.error"
+        :memory="m.memory"
+        :recall-loading="m.recallLoading"
       />
 
       <!-- 底部留白，避免最后一条被输入框遮挡 -->
